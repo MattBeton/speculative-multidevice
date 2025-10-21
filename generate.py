@@ -18,20 +18,21 @@ def main():
 
     # --- PREFILL ---
     t0 = time.perf_counter()
-    next_id, topk_idx, topk_vals = model.forward(ids)
+    toks, topk_idx, topk_vals = model.forward(ids, only_final=False)
     t1 = time.perf_counter()
     prefill_tokens = len(ids)
 
     # First generated token comes from the last prefill logits (no extra model call)
-    generated = [next_id]
+    generated = [toks[-1]]
     eos = model.eos_token_id
 
     # --- DECODE one token at a time with KV cache (only pass the LAST token) ---
     t2 = time.perf_counter()
-    last = next_id
+    last = toks[-1]
     for _ in range(MAX_NEW_TOKENS - 1):
         y = np.array([[last]], dtype=np.int32)    # (1, 1)
-        last, topk_idx, topk_vals = model.forward(y)
+        toks, topk_idx, topk_vals = model.forward(y)
+        last = toks[-1]
         generated.append(last)
         if eos is not None and last == eos:
             break

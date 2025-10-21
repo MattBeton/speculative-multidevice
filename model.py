@@ -11,32 +11,55 @@ SEED = 0
 TOP_K = 40
 
 def topk_sample_numpy(logits: np.array, k: int) -> tuple[int, np.array, np.array]:
-    topk_vals = np.partition(logits, -k)[-k:]  # k largest values
-    topk_idx = np.argpartition(logits, -k)[-k:]  # their indices
-    masked = np.where(logits < topk_vals.min(), -np.inf, logits)
-    probs = np.exp(masked - masked.max())  # numerical stability
-    probs /= probs.sum()
-    sample = np.random.choice(len(logits), p=probs)
-    return int(sample), topk_idx, topk_vals
+    # Keep original shape for final output
+    shape = logits.shape
+    vocab_size = shape[-1]
+    
+    # Reshape to 2D: (batch_dims, vocab_size)
+    logits_2d = logits.reshape(-1, vocab_size)
+    batch_size = logits_2d.shape[0]
+    
+    # Compute top-k values and indices per row
+    topk_vals = np.partition(logits_2d, -k)[:, -k:]  # (batch_size, k)
+    topk_idx = np.argpartition(logits_2d, -k)[:, -k:]  # (batch_size, k)
+    
+    # Mask logits: set values below top-k to -inf
+    min_topk = topk_vals.min(axis=1, keepdims=True)  # (batch_size, 1)
+    masked = np.where(logits_2d < min_topk, -np.inf, logits_2d)
+    
+    # Softmax with numerical stability
+    logit_max = masked.max(axis=1, keepdims=True)
+    probs = np.exp(masked - logit_max)
+    probs /= probs.sum(axis=1, keepdims=True)
+    
+    # Sample one token per row
+    samples = np.array([np.random.choice(vocab_size, p=p) for p in probs])
+    
+    # Reshape topk_idx and topk_vals back to original batch shape
+    topk_idx = topk_idx.reshape(*shape[:-1], k)
+    topk_vals = topk_vals.reshape(*shape[:-1], k)
+    
+    # Return first sample (as scalar) and top-k info with original batch shape
+    return list(samples), topk_idx, topk_vals
 
-# def topk_sample_mlx(logits: mx.array, k: int) -> tuple[int, mx.array, mx.array]:
-#     logits = logits.reshape(-1)  # Ensure 1D
-#     topk_vals = mx.topk(logits, k)
-#     topk_idx = mx.argpartition(logits, -k)[-k:]
-#     masked = mx.where(logits < topk_vals.min(), float("-inf"), logits)
-#     probs = mx.exp(masked - masked.max())
-#     probs /= mx.sum(probs)
-#     sample = mx.random.categorical(probs)
-#     return sample, topk_idx, topk_vals
 
 def topk_sample_mlx(logits, k: int) -> int:
     """
     logits: (1, V) MLX array (unnormalized)
     Currently spoofing the topk idx&val return. Get an LM to fix this when we are landed.
     """
+    V = logits.shape[-1]  # vocab size
     kth = mx.min(mx.topk(logits, k), axis=-1, keepdims=True)  # (1,1)
     masked = mx.where(logits < kth, float("-inf"), logits)    # (1,V)
-    return mx.random.categorical(masked, axis=-1)[0], mx.arange(TOP_K), logits[:, :TOP_K].flatten()
+    sampled_token = mx.random.categorical(masked, axis=-1)[0]
+
+    # topk_idx = mx.arange(V)[logits < kth]
+    # topk_val = logits[logits < kth]
+
+    # return sampled_token, topk_idx, topk_val
+    #
+    return sampled_token, mx.arange(TOP_K), logits[:, :TOP_K].flatten()
+
 
 
 class GenerationModel(ABC):
@@ -67,14 +90,15 @@ class MLXGenerationModel(GenerationModel):
 
         if only_final:
             logits = logits[:, -1, :]
-        else:
-            raise NotImpelementedError()
 
-        tok, topk_idx, topk_vals = topk_sample_mlx(logits, TOP_K)
+        tok, topk_idx, topk_vals = topk_sample_numpy(np.asarray(logits.astype(mx.float32)), TOP_K)
+        return tok, topk_idx, topk_vals
 
-        mx.eval(tok, topk_idx, topk_vals)
-
-        return int(tok.item()), np.asarray(topk_idx.astype(mx.int32)), np.asarray(topk_vals.astype(mx.float32))
+        ### TODO: When we figure out MLX topk
+        # tok, topk_idx, topk_vals = topk_sample_mlx(logits, TOP_K)
+        # mx.eval(tok, topk_idx, topk_vals)
+        #
+        # return int(tok.item()), np.asarray(topk_idx.astype(mx.int32)), np.asarray(topk_vals.astype(mx.float32))
 
     def tokenize(self, prompt: str) -> np.array:
         return np.array(self.tok.apply_chat_template(
