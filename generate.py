@@ -9,14 +9,7 @@ from model import MLXGenerationModel
 MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/73e3e38d981303bc594367cd910ea6eb48349da8")
 PROMPT = "Write a terse haiku about Apple MLX."
 MAX_NEW_TOKENS = 64
-TOP_K = 40
 
-def topk_sample(logits: np.array, k: int) -> int:
-    kth = np.partition(logits, -k)[-k]
-    masked = np.where(logits < kth, -np.inf, logits)
-    probs = np.exp(masked - np.max(masked))
-    probs /= probs.sum()
-    return int(np.random.choice(len(probs), p=probs))
 
 def main():
     model = MLXGenerationModel(MODEL_PATH)
@@ -25,13 +18,11 @@ def main():
 
     # --- PREFILL ---
     t0 = time.perf_counter()
-    logits = model.forward(ids)
+    next_id, topk_idx, topk_vals = model.forward(ids)
     t1 = time.perf_counter()
     prefill_tokens = len(ids)
 
     # First generated token comes from the last prefill logits (no extra model call)
-    last_logits = logits[0, -1, :]                 # (1, V)
-    next_id = topk_sample(last_logits, TOP_K)
     generated = [next_id]
     eos = model.eos_token_id
 
@@ -40,8 +31,7 @@ def main():
     last = next_id
     for _ in range(MAX_NEW_TOKENS - 1):
         y = np.array([[last]], dtype=np.int32)    # (1, 1)
-        logits = model.forward(y)                 # uses the cache, returns (1, 1, V)
-        last = topk_sample(logits[0, -1, :], TOP_K)
+        last, topk_idx, topk_vals = model.forward(y)
         generated.append(last)
         if eos is not None and last == eos:
             break
