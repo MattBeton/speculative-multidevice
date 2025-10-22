@@ -24,17 +24,17 @@ def main():
     assert (ids == ids_draft).all()
     eos = base_model.eos_token_id()
 
-    # --- PREFILL ---
-    draft_model.forward(ids[:-1], only_final=False)
-    base_model.forward(ids[:-1], only_final=False)  # warm cache
+    # --- PREFILL (cache = prefix without last token) ---
+    draft_model.rewind_to_prefix(ids[:-1])
+    base_model.rewind_to_prefix(ids[:-1])
 
     valid_idx = len(ids) - 1
-    draft_idx = len(ids) - 1
+    prompt_length = valid_idx
 
 
     # --- DECODE one token at a time with KV cache (only pass the LAST token) ---
-    last = int(ids[-1])  # ensure scalar
-    while valid_idx < len(ids) + MAX_NEW_TOKENS:
+    while valid_idx < prompt_length + MAX_NEW_TOKENS:
+        last = int(ids[-1])  # ensure scalar and refresh each iteration from current sequence
         draft_toks = []
         draft_topk_idx = []
         draft_topk_vals = []
@@ -52,11 +52,11 @@ def main():
         draft_topk_idx = np.stack(draft_topk_idx, axis=0)                    # (K, TOP_K)
         draft_topk_vals = np.stack(draft_topk_vals, axis=0)                  # (K, TOP_K)
 
-
-
-        toks_verify = np.concatenate((np.array([ids[-1]]), draft_toks)) # TODO: This needs changing to work on iterations of the while loop past the first one.
+        # Verify against base: start from the CURRENT last accepted token
+        toks_verify = np.concatenate((np.array([ids[-1]], dtype=np.int32), draft_toks))
 
         if SPEC_K > 1:
+            # Base cache currently at ids[:-1]; advance across last+K for top-k rows per step
             _, base_topk_idx, base_topk_vals = base_model.forward(
                 toks_verify,
                 only_final=False
@@ -66,6 +66,8 @@ def main():
 
         print('-'*100)
 
+        accepted_tokens = []
+        hit_eos = False
         for i, tok in enumerate(draft_toks):
             # draft top-k info for this step (tok is guaranteed to be within it)
             d_idx_row = draft_topk_idx[i]
@@ -100,13 +102,29 @@ def main():
                 break
 
             if eos is not None and tok == eos:
+                accepted_tokens.append(tok)
+                hit_eos = True
                 break
 
-        if eos is not None and tok == eos:
+            accepted_tokens.append(tok)
+
+        # Incorporate accepted tokens into the running sequence
+        if accepted_tokens:
+            ids = np.concatenate((ids, np.array(accepted_tokens, dtype=np.int32)))
+            valid_idx += len(accepted_tokens)
+
+        # If EOS hit or token budget reached, stop
+        if hit_eos or (valid_idx >= prompt_length + MAX_NEW_TOKENS):
             break
 
-        # TODO: Finish up & get ready for next iteration.
-        # If we didn't accept all tokens then we need to roll back kv cache of both models.
+        # Finish up & get ready for next iteration.
+        # Roll back KV caches of both models to the prefix *excluding* the new last token.
+        # That way the next step can pass only the (new) last token.
+        draft_model.rewind_to_prefix(ids[:-1])
+        base_model.rewind_to_prefix(ids[:-1])
+
+
+    print(base_model.decode(ids[prompt_length:]))
 
 if __name__ == "__main__":
     main()
