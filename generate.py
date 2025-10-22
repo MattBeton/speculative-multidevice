@@ -7,7 +7,8 @@ from model import MLXGenerationModel, TOP_K
 
 DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-4bit/snapshots/").glob("*")
 DRAFT_MODEL_PATH = next(DRAFT_MODEL_PATH)
-BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
+# BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
+BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/").glob("*")
 BASE_MODEL_PATH = next(BASE_MODEL_PATH)
 # PROMPT = "Write a terse haiku about Apple MLX."
 PROMPT = "Why is the sky blue?"
@@ -26,14 +27,20 @@ def main():
     eos = base_model.eos_token_id()
 
     # --- PREFILL (cache = prefix without last token) ---
+    prefill_start = time.perf_counter()
     draft_model.forward(ids[:-1])
     base_model.forward(ids[:-1])
+    prefill_time = time.perf_counter() - prefill_start
+    prefill_tokens = len(ids) - 1
+    prefill_tps = (prefill_tokens / prefill_time) if prefill_time else float("inf")
+    print(f"Prefill: {prefill_tokens} tokens in {prefill_time:.3f}s ({prefill_tps:.2f} tok/s)")
 
     valid_idx = len(ids) - 1
     prompt_length = valid_idx
 
 
     # --- DECODE one token at a time with KV cache (only pass the LAST token) ---
+    decode_start = time.perf_counter()
     while valid_idx < prompt_length + MAX_NEW_TOKENS:
         last = int(ids[-1])  # ensure scalar and refresh each iteration from current sequence
         draft_toks = []
@@ -124,9 +131,11 @@ def main():
         draft_model.trim_cache(SPEC_K - i)
         base_model.trim_cache(SPEC_K - i)
 
-
+    decode_time = time.perf_counter() - decode_start
+    generated_tokens = max(len(ids) - prompt_length, 0)
+    decode_tps = (generated_tokens / decode_time) if decode_time else float("inf")
+    print(f"Decode: {generated_tokens} tokens in {decode_time:.3f}s ({decode_tps:.2f} tok/s)")
     print(base_model.decode(ids[prompt_length:]))
 
 if __name__ == "__main__":
     main()
-
