@@ -5,11 +5,13 @@ import numpy as np
 
 from model import MLXGenerationModel, TOP_K
 
-DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-4bit/snapshots/").glob("*")
+
+DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
 DRAFT_MODEL_PATH = next(DRAFT_MODEL_PATH)
 # BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
 BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/").glob("*")
 BASE_MODEL_PATH = next(BASE_MODEL_PATH)
+
 # PROMPT = "Write a terse haiku about Apple MLX."
 PROMPT = "Why is the sky blue?"
 
