@@ -5,14 +5,16 @@ import numpy as np
 
 from model import MLXGenerationModel, TOP_K
 
-DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-4bit/snapshots/73e3e38d981303bc594367cd910ea6eb48349da8")
-BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-8bit/snapshots/0e42af58449718de7931ee04f28191fbe6c43a56")
+DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-4bit/snapshots/").glob("*")
+DRAFT_MODEL_PATH = next(DRAFT_MODEL_PATH)
+BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
+BASE_MODEL_PATH = next(BASE_MODEL_PATH)
 PROMPT = "Write a terse haiku about Apple MLX."
 
 MAX_NEW_TOKENS = 64
 SPEC_K = 8
 
-
+    
 def main():
     draft_model = MLXGenerationModel(DRAFT_MODEL_PATH)
     base_model = MLXGenerationModel(BASE_MODEL_PATH)
@@ -23,8 +25,8 @@ def main():
     eos = base_model.eos_token_id()
 
     # --- PREFILL ---
-    _, base_pref_idx, base_pref_vals = base_model.forward(ids[:-1], only_final=False)
     draft_model.forward(ids[:-1], only_final=False)
+    base_model.forward(ids[:-1], only_final=False)  # warm cache
 
     valid_idx = len(ids) - 1
     draft_idx = len(ids) - 1
@@ -40,9 +42,6 @@ def main():
         for _ in range(SPEC_K):
             y = np.array([[last]], dtype=np.int32)    # (1, 1)
             tok, topk_idx, topk_vals = draft_model.forward(y)
-            print(f'generated token {draft_model.decode(tok)}')
-            print(topk_idx.shape)
-            print(f'topk tokens {[draft_model.decode(x) for x in topk_idx.flatten()]}')
             t = int(tok[0])
             last = t
             draft_toks.append(t)
@@ -53,21 +52,17 @@ def main():
         draft_topk_idx = np.stack(draft_topk_idx, axis=0)                    # (K, TOP_K)
         draft_topk_vals = np.stack(draft_topk_vals, axis=0)                  # (K, TOP_K)
 
-        # Base distributions aligned to *verify* each token:
-        #  - t1 uses base_pref_* last row (p(next|prompt))
-        #  - t2..tK use base run on t1..t_{K-1} (rows 0..K-2)
-        base_idx_0 = base_pref_idx[-1]                                      # (TOP_K,)
-        base_vals_0 = base_pref_vals[-1]                                    # (TOP_K,)
 
-        toks_verify = np.concatenate((np.array([ids[-1]]), draft_toks))
+
+        toks_verify = np.concatenate((np.array([ids[-1]]), draft_toks)) # TODO: This needs changing to work on iterations of the while loop past the first one.
 
         if SPEC_K > 1:
-            _, base_seq_idx, base_seq_vals = base_model.forward(
+            _, base_topk_idx, base_topk_vals = base_model.forward(
                 toks_verify,
                 only_final=False
             )
         else:
-            base_seq_idx = base_seq_vals = None
+            base_topk_idx = base_topk_vals = None
 
         print('-'*100)
 
@@ -81,29 +76,37 @@ def main():
             draft_logit = d_val_row[d_mask][0]
 
             # base top-k row aligned to *this* token
-            if i == 0:
-                b_idx_row, b_val_row = base_idx_0, base_vals_0
-            else:
-                b_idx_row, b_val_row = base_seq_idx[i], base_seq_vals[i]
+            b_idx_row, b_val_row = base_topk_idx[i], base_topk_vals[i]
             b_mask = (b_idx_row == tok)
             in_base_topk = b_mask.any()
             base_logit = b_val_row[b_mask][0] if in_base_topk else float('-inf')
 
-            print(f'tok {draft_model.decode(tok)}')
-            print(f'topk tokens - base {[draft_model.decode(x) for x in b_idx_row]}')
+            if base_logit == float('-inf'):
+                accepted = False
+            else:
+                if draft_logit <= base_logit:
+                    accepted = True
+                else:
+                    u = np.random.uniform(0, 1)
+                    if u <= base_logit / draft_logit:
+                        accepted = True
+                    else:
+                        accepted = False
 
             print(f"i={i} tok={tok} in_base_topk={in_base_topk} draft_logit={float(draft_logit):.3f} base_logit={float(base_logit):.3f}")
+            print(f'{accepted=}')
 
-        # stop here for debugging
-        raise SystemExit(0)
+            if not accepted:
+                break
 
-        # if eos is not None and last == eos:
-        #     break
+            if eos is not None and tok == eos:
+                break
 
+        if eos is not None and tok == eos:
+            break
 
-    # --- Report & show text ---
-    # TODO: implement accept/commit and final decode
-    pass
+        # TODO: Finish up & get ready for next iteration.
+        # If we didn't accept all tokens then we need to roll back kv cache of both models.
 
 if __name__ == "__main__":
     main()
