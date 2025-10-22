@@ -9,7 +9,8 @@ DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-communi
 DRAFT_MODEL_PATH = next(DRAFT_MODEL_PATH)
 BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
 BASE_MODEL_PATH = next(BASE_MODEL_PATH)
-PROMPT = "Write a terse haiku about Apple MLX."
+# PROMPT = "Write a terse haiku about Apple MLX."
+PROMPT = "Why is the sky blue?"
 
 MAX_NEW_TOKENS = 64
 SPEC_K = 8
@@ -25,8 +26,8 @@ def main():
     eos = base_model.eos_token_id()
 
     # --- PREFILL (cache = prefix without last token) ---
-    draft_model.rewind_to_prefix(ids[:-1])
-    base_model.rewind_to_prefix(ids[:-1])
+    draft_model.forward(ids[:-1])
+    base_model.forward(ids[:-1])
 
     valid_idx = len(ids) - 1
     prompt_length = valid_idx
@@ -95,8 +96,8 @@ def main():
                     else:
                         accepted = False
 
-            print(f"i={i} tok={tok} in_base_topk={in_base_topk} draft_logit={float(draft_logit):.3f} base_logit={float(base_logit):.3f}")
-            print(f'{accepted=}')
+            # print(f"i={i} tok={tok} in_base_topk={in_base_topk} draft_logit={float(draft_logit):.3f} base_logit={float(base_logit):.3f}")
+            # print(f'{accepted=}')
 
             if not accepted:
                 break
@@ -120,8 +121,8 @@ def main():
         # Finish up & get ready for next iteration.
         # Roll back KV caches of both models to the prefix *excluding* the new last token.
         # That way the next step can pass only the (new) last token.
-        draft_model.rewind_to_prefix(ids[:-1])
-        base_model.rewind_to_prefix(ids[:-1])
+        draft_model.trim_cache(SPEC_K - i)
+        base_model.trim_cache(SPEC_K - i)
 
 
     print(base_model.decode(ids[prompt_length:]))

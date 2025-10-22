@@ -1,5 +1,7 @@
 from abc import ABC
 from pathlib import Path
+from mlx.nn.layers.base import tree_flatten
+from mlx.utils import tree_map
 import numpy as np
 
 import mlx.core as mx
@@ -109,18 +111,14 @@ class MLXGenerationModel(GenerationModel):
         """Reset KV cache to empty."""
         self.cache = make_prompt_cache(self.model)
 
-    def rewind_to_prefix(self, tokens: np.array) -> None:
+    def trim_cache(self, n: int) -> None:
         """
         Reset the KV cache and prefill it with `tokens` (1D array).
         Useful for speculative decoding rollback to the last accepted prefix.
         """
-        # Reset cache
-        self.cache = make_prompt_cache(self.model)
-        # Prefill if there's a non-empty prefix
-        if tokens is not None and tokens.size > 0:
-            tokens_mlx = mx.array(tokens.reshape((1, -1)), dtype=mx.int32)
-            _ = self.model(tokens_mlx, cache=self.cache)
-            mx.eval(_)
+        # tree_map(lambda x: print(x.keys.shape) if x.keys is not None else None, self.cache)
+        for c in self.cache:
+            c.trim(n)
 
     def forward(self, tokens: np.array, only_final=True) -> np.array:
         tokens_mlx = mx.array(tokens.reshape((1, -1)), dtype=mx.int32)
