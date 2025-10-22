@@ -113,9 +113,6 @@ class MLXGenerationModel(GenerationModel):
         if only_final:
             logits = logits[:, -1, :]
 
-        # tok, topk_idx, topk_vals = topk_sample_numpy(np.asarray(logits.astype(mx.float32)), TOP_K)
-        # return tok, topk_idx, topk_vals
-
         ## TODO: When we figure out MLX topk
         tok, topk_idx, topk_vals = topk_sample_mlx(logits, TOP_K)
         mx.eval(tok, topk_idx, topk_vals)

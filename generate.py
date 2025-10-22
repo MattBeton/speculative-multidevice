@@ -33,9 +33,9 @@ def main():
     # --- DECODE one token at a time with KV cache (only pass the LAST token) ---
     last = ids[-1]
     while valid_idx < len(ids) + MAX_NEW_TOKENS:
-        draft_toks = np.zeros([1], dtype=np.int32)
-        draft_idx = np.zeros([1, TOP_K], dtype=np.int32)
-        draft_vals = np.zeros([1, TOP_K], dtype=np.float32)
+        draft_toks = np.empty((0), dtype=np.int32)
+        draft_idx = np.empty((0, TOP_K), dtype=np.int32)
+        draft_vals = np.empty((0, TOP_K), dtype=np.float32)
 
         for _ in range(SPEC_K):
             y = np.array([[last]], dtype=np.int32)    # (1, 1)
@@ -45,12 +45,34 @@ def main():
             draft_idx = np.concatenate([draft_idx, topk_idx], axis=0)
             draft_vals = np.concatenate([draft_vals, topk_vals], axis=0)
 
-        draft_toks = draft_toks[1:]
-        draft_idx = draft_idx[1:]
-        draft_vals = draft_vals[1:]
-        print(list(draft_toks))
+        # print(list(draft_toks))
+        # print(draft_idx)
 
-        _, topk_idx, topk_vals = base_model.forward(draft_toks, only_final=False)
+        _, base_idx, base_vals = base_model.forward(draft_toks, only_final=False)
+
+        for i in range(SPEC_K):
+            tok = draft_toks[i]
+            print(f'{tok=}')
+
+            print(base_idx)
+
+            draft_idx_mask = (draft_idx[i,:] == tok)
+            if draft_idx_mask.sum() == 0:
+                print('reject!')
+            elif draft_idx_mask.sum() > 1:
+                raise Exception('WHAT')
+            p_draft = np.where(draft_idx_mask, draft_vals[i,:], 0).sum()
+            print(f'{p_draft=}')
+
+            base_idx_mask = (base_idx[i,:] == tok)
+            if base_idx_mask.sum() == 0:
+                print('reject!')
+            elif base_idx_mask.sum() > 1:
+                raise Exception('WHAT')
+            p_base = np.where(base_idx_mask, base_vals[i,:], 0).sum()
+            print(f'{p_base=}')
+
+            raise Exception()
 
         # if eos is not None and last == eos:
         #     break
