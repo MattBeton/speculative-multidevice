@@ -43,22 +43,44 @@ def topk_sample_numpy(logits: np.array, k: int) -> tuple[int, np.array, np.array
     return list(samples), topk_idx, topk_vals
 
 
-def topk_sample_mlx(logits, k: int) -> int:
+def topk_sample_mlx(logits, k: int):
     """
-    logits: (1, V) MLX array (unnormalized)
-    Currently spoofing the topk idx&val return. Get an LM to fix this when we are landed.
+    Top-k sampling in MLX without boolean indexing.
+
+    Args:
+        logits: MLX array of shape (B, V) or (1, V); unnormalized scores.
+        k:      number of top candidates.
+
+    Returns:
+        sampled_token: MLX int array of shape (B,), token ids sampled from top-k.
+        topk_idx:      MLX int32 array of shape (B, k), indices of top-k per row.
+        topk_vals:     MLX float array of shape (B, k), logits of top-k per row.
     """
-    V = logits.shape[-1]  # vocab size
-    kth = mx.min(mx.topk(logits, k), axis=-1, keepdims=True)  # (1,1)
-    masked = mx.where(logits < kth, float("-inf"), logits)    # (1,V)
-    sampled_token = mx.random.categorical(masked, axis=-1)[0]
+    # Ensure 2D (B, V)
+    if logits.ndim == 1:
+        logits = logits[None, :]
+    if logits.ndim == 3:
+        logits = logits.squeeze(0)
 
-    # topk_idx = mx.arange(V)[logits < kth]
-    # topk_val = logits[logits < kth]
+    B, V = logits.shape
+    k = int(k if k <= V else V)  # clamp
 
-    # return sampled_token, topk_idx, topk_val
-    #
-    return sampled_token, mx.arange(TOP_K), logits[:, :TOP_K].flatten()
+    # 1) Indices of the k largest elements (order within k is unspecified)
+    #    Use argpartition at position V-k so the last k positions hold the largest k.
+    idx_part = mx.argpartition(logits, kth=V - k, axis=-1)              # (B, V)
+    topk_idx = idx_part[:, -k:].astype(mx.int32)                        # (B, k)
+
+    # 2) Gather their logits (aligned with topk_idx)
+    topk_vals = mx.take_along_axis(logits, topk_idx, axis=-1)           # (B, k)
+
+    # 3) Sample inside the k-slice using unnormalized logits
+    #    categorical() removes the axis '-1' and returns shape (B,)
+    choice_in_k = mx.random.categorical(topk_vals, axis=-1).astype(mx.int32)  # (B,)
+
+    # 4) Map sampled positions back to vocab ids
+    sampled_token = mx.take_along_axis(topk_idx, choice_in_k[:, None], axis=-1).squeeze(-1)  # (B,)
+
+    return sampled_token, topk_idx, topk_vals
 
 
 
@@ -91,14 +113,14 @@ class MLXGenerationModel(GenerationModel):
         if only_final:
             logits = logits[:, -1, :]
 
-        tok, topk_idx, topk_vals = topk_sample_numpy(np.asarray(logits.astype(mx.float32)), TOP_K)
-        return tok, topk_idx, topk_vals
+        # tok, topk_idx, topk_vals = topk_sample_numpy(np.asarray(logits.astype(mx.float32)), TOP_K)
+        # return tok, topk_idx, topk_vals
 
-        ### TODO: When we figure out MLX topk
-        # tok, topk_idx, topk_vals = topk_sample_mlx(logits, TOP_K)
-        # mx.eval(tok, topk_idx, topk_vals)
-        #
-        # return int(tok.item()), np.asarray(topk_idx.astype(mx.int32)), np.asarray(topk_vals.astype(mx.float32))
+        ## TODO: When we figure out MLX topk
+        tok, topk_idx, topk_vals = topk_sample_mlx(logits, TOP_K)
+        mx.eval(tok, topk_idx, topk_vals)
+
+        return np.asarray(tok.astype(mx.int32)), np.asarray(topk_idx.astype(mx.int32)), np.asarray(topk_vals.astype(mx.float32))
 
     def tokenize(self, prompt: str) -> np.array:
         return np.array(self.tok.apply_chat_template(
