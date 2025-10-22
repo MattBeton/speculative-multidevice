@@ -7,7 +7,7 @@ from mlx_lm.tokenizer_utils import load_tokenizer
 from mlx_lm.utils import load_model
 from mlx_lm.models.cache import make_prompt_cache
 
-SEED = 0
+SEED = 90
 TOP_K = 40
 
 def topk_sample_numpy(logits: np.array, k: int) -> tuple[int, np.array, np.array]:
@@ -128,4 +128,4 @@ class MLXGenerationModel(GenerationModel):
         return self.tok.decode(generated)
 
     def eos_token_id(self) -> int:
-        return getattr(tok, "eos_token_id", None)
+        return getattr(self.tok, "eos_token_id", None)

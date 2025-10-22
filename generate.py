@@ -20,10 +20,10 @@ def main():
     ids_draft = draft_model.tokenize(PROMPT)
     ids = base_model.tokenize(PROMPT)
     assert (ids == ids_draft).all()
-    eos = base_model.eos_token_id
+    eos = base_model.eos_token_id()
 
     # --- PREFILL ---
-    toks, topk_idx, topk_vals = base_model.forward(ids, only_final=False)
+    _, base_pref_idx, base_pref_vals = base_model.forward(ids[:-1], only_final=False)
     draft_model.forward(ids[:-1], only_final=False)
 
     valid_idx = len(ids) - 1
@@ -31,57 +31,79 @@ def main():
 
 
     # --- DECODE one token at a time with KV cache (only pass the LAST token) ---
-    last = ids[-1]
+    last = int(ids[-1])  # ensure scalar
     while valid_idx < len(ids) + MAX_NEW_TOKENS:
-        draft_toks = np.empty((0), dtype=np.int32)
-        draft_idx = np.empty((0, TOP_K), dtype=np.int32)
-        draft_vals = np.empty((0, TOP_K), dtype=np.float32)
+        draft_toks = []
+        draft_topk_idx = []
+        draft_topk_vals = []
 
         for _ in range(SPEC_K):
             y = np.array([[last]], dtype=np.int32)    # (1, 1)
-            toks, topk_idx, topk_vals = draft_model.forward(y)
-            last = toks[-1:]
-            draft_toks = np.concatenate([draft_toks, last])
-            draft_idx = np.concatenate([draft_idx, topk_idx], axis=0)
-            draft_vals = np.concatenate([draft_vals, topk_vals], axis=0)
+            tok, topk_idx, topk_vals = draft_model.forward(y)
+            print(f'generated token {draft_model.decode(tok)}')
+            print(topk_idx.shape)
+            print(f'topk tokens {[draft_model.decode(x) for x in topk_idx.flatten()]}')
+            t = int(tok[0])
+            last = t
+            draft_toks.append(t)
+            draft_topk_idx.append(topk_idx[0])
+            draft_topk_vals.append(topk_vals[0])
 
-        # print(list(draft_toks))
-        # print(draft_idx)
+        draft_toks = np.array(draft_toks, dtype=np.int32)                    # (K,)
+        draft_topk_idx = np.stack(draft_topk_idx, axis=0)                    # (K, TOP_K)
+        draft_topk_vals = np.stack(draft_topk_vals, axis=0)                  # (K, TOP_K)
 
-        _, base_idx, base_vals = base_model.forward(draft_toks, only_final=False)
+        # Base distributions aligned to *verify* each token:
+        #  - t1 uses base_pref_* last row (p(next|prompt))
+        #  - t2..tK use base run on t1..t_{K-1} (rows 0..K-2)
+        base_idx_0 = base_pref_idx[-1]                                      # (TOP_K,)
+        base_vals_0 = base_pref_vals[-1]                                    # (TOP_K,)
 
-        for i in range(SPEC_K):
-            tok = draft_toks[i]
-            print(f'{tok=}')
+        toks_verify = np.concatenate((np.array([ids[-1]]), draft_toks))
 
-            print(base_idx)
+        if SPEC_K > 1:
+            _, base_seq_idx, base_seq_vals = base_model.forward(
+                toks_verify,
+                only_final=False
+            )
+        else:
+            base_seq_idx = base_seq_vals = None
 
-            draft_idx_mask = (draft_idx[i,:] == tok)
-            if draft_idx_mask.sum() == 0:
-                print('reject!')
-            elif draft_idx_mask.sum() > 1:
-                raise Exception('WHAT')
-            p_draft = np.where(draft_idx_mask, draft_vals[i,:], 0).sum()
-            print(f'{p_draft=}')
+        print('-'*100)
 
-            base_idx_mask = (base_idx[i,:] == tok)
-            if base_idx_mask.sum() == 0:
-                print('reject!')
-            elif base_idx_mask.sum() > 1:
-                raise Exception('WHAT')
-            p_base = np.where(base_idx_mask, base_vals[i,:], 0).sum()
-            print(f'{p_base=}')
+        for i, tok in enumerate(draft_toks):
+            # draft top-k info for this step (tok is guaranteed to be within it)
+            d_idx_row = draft_topk_idx[i]
+            d_val_row = draft_topk_vals[i]
+            d_mask = (d_idx_row == tok)
+            if d_mask.sum() != 1:
+                raise RuntimeError("Draft top-k should contain the sampled token exactly once.")
+            draft_logit = d_val_row[d_mask][0]
 
-            raise Exception()
+            # base top-k row aligned to *this* token
+            if i == 0:
+                b_idx_row, b_val_row = base_idx_0, base_vals_0
+            else:
+                b_idx_row, b_val_row = base_seq_idx[i], base_seq_vals[i]
+            b_mask = (b_idx_row == tok)
+            in_base_topk = b_mask.any()
+            base_logit = b_val_row[b_mask][0] if in_base_topk else float('-inf')
+
+            print(f'tok {draft_model.decode(tok)}')
+            print(f'topk tokens - base {[draft_model.decode(x) for x in b_idx_row]}')
+
+            print(f"i={i} tok={tok} in_base_topk={in_base_topk} draft_logit={float(draft_logit):.3f} base_logit={float(base_logit):.3f}")
+
+        # stop here for debugging
+        raise SystemExit(0)
 
         # if eos is not None and last == eos:
         #     break
 
 
     # --- Report & show text ---
-    decode_tokens = len(draft)
-
-    print(draft_model.decode(draft))
+    # TODO: implement accept/commit and final decode
+    pass
 
 if __name__ == "__main__":
     main()
