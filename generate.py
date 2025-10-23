@@ -88,7 +88,7 @@ def _speculative_single_run(
 
             toks_verify = np.concatenate((np.array([ids[-1]], dtype=np.int32), draft_toks))
 
-            _, base_topk_idx, base_topk_vals = base_model.forward(
+            base_toks, base_topk_idx, base_topk_vals = base_model.forward(
                 toks_verify,
                 only_final=False,
             )
@@ -125,10 +125,11 @@ def _speculative_single_run(
                     hit_eos = True
                     break
 
-            if accepted_tokens:
-                total_accepted += len(accepted_tokens)
-                ids = np.concatenate((ids, np.array(accepted_tokens, dtype=np.int32)))
-                valid_idx += len(accepted_tokens)
+            accepted_tokens.append(base_toks[i])
+
+            total_accepted += len(accepted_tokens)
+            ids = np.concatenate((ids, np.array(accepted_tokens, dtype=np.int32)))
+            valid_idx += len(accepted_tokens)
 
             if hit_eos or (valid_idx >= prompt_length + MAX_NEW_TOKENS):
                 break
@@ -196,7 +197,7 @@ def main():
             print(
                 f"[spec    ] drafted {accept['drafted_avg']:.1f} toks/run, accepted {accept['accepted_avg']:.1f}  → {accept['accept_rate']:.1%} accept rate"
             )
-        # print("\n" + summary["text"])
+        print("\n" + summary["text"])
 
 
 if __name__ == "__main__":
