@@ -19,7 +19,7 @@ PROMPT = "Why is the sky blue?"
 
 MAX_NEW_TOKENS = 64
 SPEC_K_VALUES = [4, 8]
-RUNS = 3
+RUNS = 10
 
 
 def _summarize_phase(results: List[Dict], key: str) -> Dict[str, float]:
@@ -125,17 +125,40 @@ def _speculative_single_run(
                     hit_eos = True
                     break
 
-            accepted_tokens.append(base_toks[i])
+            # Number of drafted tokens accepted
+            m = len(accepted_tokens)  # m in [0, spec_k]
 
-            total_accepted += len(accepted_tokens)
+            # Append the base fallback only if we didn't end on EOS in the draft.
+            base_appended = 0
+            if not hit_eos:
+                # Base returned K+1 samples (positions 0..K); choose index m.
+                base_tok = int(base_toks[m])
+                accepted_tokens.append(base_tok)
+                base_appended = 1
+
+            # Count only the accepted draft tokens (exclude the base fallback).
+            total_accepted += m
+
             ids = np.concatenate((ids, np.array(accepted_tokens, dtype=np.int32)))
-            valid_idx += len(accepted_tokens)
+            valid_idx += (m + base_appended)
+
+            # ---- Align caches (trim BY delta, not TO absolute length) ----
+            # Drafter consumed K steps; Base consumed K+1 steps during verification.
+            # We committed (m + base_appended) steps into `ids`.
+            draft_trim = spec_k - (m + base_appended)
+            if draft_trim > 0:
+                draft_model.trim_cache(draft_trim)
+            elif draft_trim < 0:
+                # Only possible when m==spec_k and base_appended==1.
+                # Catch up the draft cache with the last accepted draft token (d_{K-1}).
+                draft_model.forward(np.array([[int(draft_toks[m - 1])]], dtype=np.int32))
+
+            base_trim = (spec_k + 1) - (m + base_appended)
+            if base_trim > 0:
+                base_model.trim_cache(base_trim)
 
             if hit_eos or (valid_idx >= prompt_length + MAX_NEW_TOKENS):
                 break
-
-            draft_model.trim_cache(spec_k - i)
-            base_model.trim_cache(spec_k - i)
 
     generated_ids = ids[prompt_length:]
     return {
