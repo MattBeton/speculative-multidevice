@@ -19,185 +19,229 @@ from shared import (
 )
 
 # ---------------- Configuration ----------------
-# Use the same model your MLX base verifier used (3B Instruct),
-# or point to any HF path or local snapshot.
-# BASE_MODEL = "meta-llama/Meta-Llama-3.2-3B-Instruct"
 BASE_MODEL = "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95/"
 HOST = "0.0.0.0"
 PORT = 7070
 
-SEED = 90               # deterministic sampling on the base
-BASE_TEMP = 1.0         # base sampling temperature
-DEFAULT_TOPK = 20       # base top-k if client sends K=0 or we can't infer it
+SEED = 90
+BASE_TEMP = 1.0
+BASE_TOPK = 20   # top-k for both prompt_logprobs and fallback logprobs
+
+# If your draft client still sends top-k *logits* (as in your MLX code), keep this True.
+# If you switch the client to send top-k *logprobs*, set this to False.
+DRAFT_VALS_ARE_LOGITS = True
 
 
-# ------------- Utility: stable log-softmax -------------
-def _log_softmax_topk_row(logits_row: List[float]) -> np.ndarray:
-    """Approximate draft log-probs over its top-k subset (for acceptance math)."""
-    x = np.array(logits_row, dtype=np.float64)
+# ----------------- Utilities -------------------
+def _logsumexp(x: np.ndarray) -> float:
     m = np.max(x)
-    z = np.exp(x - m).sum()
-    return x - m - np.log(z)
+    return float(m + np.log(np.exp(x - m).sum()))
+
+def _to_logprobs_from_topk_vals(vals: List[float]) -> np.ndarray:
+    """Convert a top-k row of either logits or logprobs to (approx) logprobs over the k tokens."""
+    arr = np.array(vals, dtype=np.float64)
+    if not DRAFT_VALS_ARE_LOGITS:
+        # Assume already logprobs of the top-k subset; just ensure it's finite.
+        return arr
+    # Treat as logits → apply log-softmax over the subset
+    lse = _logsumexp(arr)
+    return arr - lse
+
+def _sample_from_logprob_dict(lp_dict: Dict[int, object], rng: np.random.Generator) -> int:
+    """Sample a token ID from a vLLM logprob dict (token_id -> Logprob(dataclass with .logprob))."""
+    toks, lps = [], []
+    for tid, obj in lp_dict.items():
+        toks.append(int(tid))
+        lps.append(float(obj.logprob))
+    toks = np.array(toks, dtype=np.int64)
+    lps = np.array(lps, dtype=np.float64)
+    # Normalize over subset
+    m = np.max(lps)
+    p = np.exp(lps - m)
+    p /= p.sum()
+    idx = int(rng.choice(len(toks), p=p))
+    return int(toks[idx])
+
+def _get_prompt_logprobs(request_output) -> List[Optional[Dict[int, object]]]:
+    """vLLM attaches prompt_logprobs on the RequestOutput (version-dependent)."""
+    # Prefer request-level attribute (current vLLM behavior)
+    # TODO: Do we need to add the final logprobs as well?
+    return getattr(request_output.outputs[0], "prompt_logprobs", None)
 
 
+# ----------------- Session ---------------------
 @dataclass
-class _BaseStep:
-    """Holds base's per-step result for convenience."""
-    next_token: int
-    topk: Dict[int, object]  # vLLM Logprob objects: have .logprob and .decoded_token (optional)
-
+class _VerifyOutcome:
+    accepted_len: int
+    base_token: Optional[int]
+    hit_eos: bool
+    new_context: List[int]
 
 class VerifierSession:
     """
-    Minimal session state for the vLLM base verifier.
-    Matches the behavior of your MLX verifier, but we compute verification
-    step-by-step using vLLM's one-token generation with logprobs.
+    vLLM-based verifier that matches your MLX server interface, but verifies K draft tokens
+    in *one* call using `prompt_logprobs` and uses `logprobs` for the fallback.
     """
-
     def __init__(self, llm: LLM, tok: PreTrainedTokenizer):
         self.llm = llm
         self.tok = tok
         self.eos: Optional[int] = getattr(tok, "eos_token_id", None)
-        self._context: List[int] = []      # committed context: full prompt + accepted/fallback tokens
+        self._ctx: List[int] = []  # committed context
+        self.rng = np.random.default_rng(SEED)
 
     async def reset(self) -> None:
-        self._context = []
+        self._ctx = []
 
     async def prefill(self, prompt: List[int]) -> None:
-        # We simply store the full prompt. vLLM's prefix caching will help later.
         if not prompt:
             raise ValueError("empty prompt")
-        self._context = [int(t) for t in prompt]
+        # Store full prompt as committed context; vLLM will prefix-cache internally.
+        self._ctx = [int(t) for t in prompt]
 
-    # ----------- vLLM one-step helper -----------
-    async def _base_step(self, k: int) -> _BaseStep:
-        """
-        Query base distribution for the *next* token given current context.
-        Returns base-chosen token (per vLLM sampler) and a dict of top-k logprobs.
-        """
+    async def verify(self, req: VerifyRequest) -> VerifyResponse:
+        draft_toks = [int(t) for t in req.draft_toks]
+        if len(draft_toks) == 0:
+            # K = 0: ask base for one token (pure decoding)
+            outcome = await self._verify_k0()
+            self._ctx = outcome.new_context
+            return VerifyResponse(
+                accepted_len=outcome.accepted_len,
+                base_token=outcome.base_token,
+                hit_eos=outcome.hit_eos,
+            )
 
-         sp = SamplingParams(
-            max_tokens=1,
-            logprobs=int(20),
-            top_p=1.0,
-            seed=9,
-            detokenize=False,
-        )
-       sp = SamplingParams(
-            max_tokens=1,
-            logprobs=int(20),
-            top_p=1.0,
-            seed=SEED,
-            detokenize=False,
-        )
-
+        # 1) Single vLLM call with teacher-forced prompt = context + draft_toks
+        prompt_ids = self._ctx + draft_toks
         sp = SamplingParams(
             max_tokens=1,
-            logprobs=int(k),
+            prompt_logprobs=int(BASE_TOPK),
+            logprobs=int(BASE_TOPK),
             temperature=float(BASE_TEMP),
             top_p=1.0,
             seed=SEED,
             detokenize=False,
         )
-        # Run synchronously inside a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
-        out = await loop.run_in_executor(
+        req_out = (await loop.run_in_executor(
             None,
-            lambda: self.llm.generate([TokensPrompt(prompt_token_ids=self._context)], sp),
-        )
-        seq_out = out[0].outputs[0]
-        next_token = int(seq_out.token_ids[0])
-        # Dict[int, Logprob] for the single generated position
-        logprobs_dict: Dict[int, object] = seq_out.logprobs[0]
-        return _BaseStep(next_token=next_token, topk=logprobs_dict)
+            lambda: self.llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sp),
+        ))[0]
 
-    async def verify(self, req: VerifyRequest) -> VerifyResponse:
-        """
-        Implements the same verify contract as your MLX server:
-          - Accept as many drafted tokens as possible using the speculative criteria.
-          - If we didn't hit EOS inside the accepted draft, append base fallback token.
-          - Update committed context accordingly.
-        """
-        draft_toks = [int(t) for t in req.draft_toks]
-        d_topk_idx = [list(map(int, row)) for row in req.draft_topk_idx]
-        d_topk_vals = [[float(v) for v in row] for row in req.draft_topk_vals]
+        # 2) Pull prompt_logprobs; slice to the last K (the drafted tokens we appended)
+        full_prompt_lp = _get_prompt_logprobs(req_out)
+        if full_prompt_lp is None:
+            raise RuntimeError("vLLM did not return prompt_logprobs (ensure prompt_logprobs>0).")
 
-        # Infer base top-k from the draft's rows; fall back if K=0
-        base_k = int(d_topk_idx[0] and len(d_topk_idx[0]) or DEFAULT_TOPK) if d_topk_idx else DEFAULT_TOPK
+        K = len(draft_toks)
+        if len(full_prompt_lp) < len(prompt_ids):
+            # Some versions may not provide the first token's logprobs; align by tail slice.
+            tail = full_prompt_lp[-K:]
+        else:
+            tail = full_prompt_lp[-K:]  # last K correspond to drafted positions
 
+        # 3) Iterate left→right applying the speculative accept rule
         accepted = 0
         hit_eos = False
-        base_token: Optional[int] = None
+        new_ctx = list(self._ctx)
 
-        # Work on a local buffer; only commit back to self._context at the end
-        ctx = list(self._context)
-
-        # Step through each drafted token
         for i, tok in enumerate(draft_toks):
-            # 1) Ask base for distribution at the current context
-            step = await self._base_step(k=base_k)
+            base_row = tail[i] or {}
+            # Base logprob for the drafted token at this position (or -inf if not in top-k)
+            base_lp = float(base_row[tok].logprob) if tok in base_row else float("-inf")
 
-            # 2) Get base log-prob of the drafted token (if in base top-k)
-            base_lp = float(step.topk[tok].logprob) if tok in step.topk else float("-inf")
-
-            # 3) Get draft "log-prob" for that token using the draft's top-k row (approx via log-softmax on subset)
-            d_ids = d_topk_idx[i] if i < len(d_topk_idx) else []
-            d_vals = d_topk_vals[i] if i < len(d_topk_vals) else []
+            # Draft logprob for that token: derive from MLX top-k vals (logits → logprobs if needed)
+            d_vals = req.draft_topk_vals[i]
+            d_ids = req.draft_topk_idx[i]
+            # Find the drafted token within the draft's own row
             try:
                 j = d_ids.index(tok)
             except ValueError:
-                # The draft's sampled token should appear exactly once in its own top-k row;
-                # if not, treat as immediate reject.
-                base_token = step.next_token
-                break
+                # Draft must include its sampled token exactly once; treat as reject if not found
+                # Fallback: sample from base distribution at this position (from base_row)
+                fallback = _sample_from_logprob_dict(base_row, self.rng) if base_row else None
+                if fallback is None:
+                    # Extremely unlikely; give up without appending
+                    return VerifyResponse(accepted_len=accepted, base_token=None, hit_eos=False)
+                new_ctx.append(fallback)
+                return VerifyResponse(accepted_len=accepted, base_token=int(fallback), hit_eos=False)
 
-            draft_lps = _log_softmax_topk_row(d_vals)
-            draft_lp = float(draft_lps[j])
+            draft_logps = _to_logprobs_from_topk_vals(d_vals)
+            draft_lp = float(draft_logps[j])
 
-            # 4) Speculative acceptance test (probability form)
-            # Accept if base_lp >= draft_lp; otherwise accept with probability exp(base_lp - draft_lp).
-            accept = False
+            # Accept if base_lp >= draft_lp; else accept w.p. exp(base_lp - draft_lp)
             if base_lp == float("-inf"):
-                accept = False
-            elif base_lp >= draft_lp:
+                # Reject
+                fallback = _sample_from_logprob_dict(base_row, self.rng) if base_row else None
+                if fallback is None:
+                    return VerifyResponse(accepted_len=accepted, base_token=None, hit_eos=False)
+                new_ctx.append(fallback)
+                return VerifyResponse(accepted_len=accepted, base_token=int(fallback), hit_eos=False)
+
+            if base_lp >= draft_lp:
                 accept = True
             else:
-                u = float(np.random.uniform(0.0, 1.0))
+                u = float(self.rng.uniform(0.0, 1.0))
                 accept = (u <= np.exp(base_lp - draft_lp))
 
             if not accept:
-                # Reject here. Append base fallback (the base's one-step choice for this position).
-                base_token = step.next_token
-                break
+                # Reject here at position i ⇒ sample fallback from *this position's* base distribution.
+                fallback = _sample_from_logprob_dict(base_row, self.rng)
+                new_ctx.append(fallback)
+                return VerifyResponse(accepted_len=accepted, base_token=int(fallback), hit_eos=False)
 
-            # Accepted the draft token; advance context
+            # Accepted this drafted token
             accepted += 1
-            ctx.append(tok)
+            new_ctx.append(tok)
 
             # EOS handling
             if self.eos is not None and tok == self.eos:
                 hit_eos = True
-                base_token = None   # by contract: no base fallback appended when EOS is hit in accepted draft
-                break
+                # By contract: no base fallback when EOS is among accepted draft tokens
+                self._ctx = new_ctx
+                return VerifyResponse(accepted_len=accepted, base_token=None, hit_eos=True)
 
-        # If we accepted ALL drafted tokens and did not hit EOS,
-        # append the base fallback one more step ahead.
-        if (accepted == len(draft_toks)) and (not hit_eos):
-            step = await self._base_step(k=base_k)
-            base_token = step.next_token
-            ctx.append(base_token)
+        # 4) If we made it here, we accepted all K and didn’t hit EOS → append base fallback
+        # Use the generated step’s logprobs for sampling the fallback (position K)
+        seq = req_out.outputs[0]
+        gen_row = seq.logprobs[0] if seq.logprobs else None
+        if not gen_row:
+            # vLLM returned no generated logprobs (shouldn't happen with logprobs>0)
+            # Fall back to using the token vLLM sampled
+            base_token = int(seq.token_ids[0])
+        else:
+            base_token = _sample_from_logprob_dict(gen_row, self.rng)
 
-        # Commit context back
-        self._context = ctx
+        new_ctx.append(base_token)
+        self._ctx = new_ctx
+        return VerifyResponse(accepted_len=accepted, base_token=int(base_token), hit_eos=False)
 
-        return VerifyResponse(
-            accepted_len=int(accepted),
-            base_token=base_token,
-            hit_eos=bool(hit_eos),
+    async def _verify_k0(self) -> _VerifyOutcome:
+        """K=0: ask base for one token (pure decoding step)."""
+        sp = SamplingParams(
+            max_tokens=1,
+            logprobs=int(BASE_TOPK),
+            temperature=float(BASE_TEMP),
+            top_p=1.0,
+            seed=SEED,
+            detokenize=False,
         )
+        loop = asyncio.get_running_loop()
+        req_out = (await loop.run_in_executor(
+            None,
+            lambda: self.llm.generate([TokensPrompt(prompt_token_ids=self._ctx)], sp),
+        ))[0]
+        seq = req_out.outputs[0]
+        # Sample from logprobs to keep the RNG path consistent
+        gen_row = seq.logprobs[0] if seq.logprobs else None
+        if gen_row:
+            base_token = _sample_from_logprob_dict(gen_row, self.rng)
+        else:
+            base_token = int(seq.token_ids[0])
+        new_ctx = self._ctx + [base_token]
+        return _VerifyOutcome(accepted_len=0, base_token=int(base_token), hit_eos=False, new_context=new_ctx)
 
 
-# -------------------- Server plumbing --------------------
+# ----------------- Server plumbing -----------------
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, llm: LLM, tok: PreTrainedTokenizer) -> None:
     peer = writer.get_extra_info("peername")
     print(f"client connected: {peer}")
@@ -226,16 +270,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 async def main() -> None:
     print(f"Loading base model with vLLM: {BASE_MODEL}")
-    llm = LLM(model=BASE_MODEL, trust_remote_code=True)  # adjust dtype/gpu_memory_utilization as needed
+    llm = LLM(model=BASE_MODEL, trust_remote_code=True)
     tok: PreTrainedTokenizer = llm.get_tokenizer()
 
     server = await asyncio.start_server(lambda r, w: handle_client(r, w, llm, tok), HOST, PORT)
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
-    print(f"Verifier (vLLM) listening on {addrs}")
+    print(f"Verifier (vLLM, teacher-forced K) listening on {addrs}")
     async with server:
         await server.serve_forever()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
