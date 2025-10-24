@@ -93,14 +93,15 @@ class DraftClient:
                     cur = t  # advance locally
 
                 # 2) Verify on base (remote)
-                await self._channel.send(
-                    VerifyRequest(
-                        draft_toks=draft_toks,
-                        draft_topk_idx=draft_topk_idx,
-                        draft_topk_vals=draft_topk_vals,
-                    )
+                req = VerifyRequest(
+                    draft_toks=draft_toks,
+                    draft_topk_idx=draft_topk_idx,
+                    draft_topk_vals=draft_topk_vals,
                 )
+                print(f'sending request {req}')
+                await self._channel.send(req)
                 resp = await self._channel.recv()
+                print(f'received response {resp}')
                 if not isinstance(resp, VerifyResponse):
                     raise RuntimeError(f"expected VerifyResponse, got {type(resp)!r}")
 
@@ -145,9 +146,11 @@ class DraftClient:
 
 
 async def main() -> None:
-    reader, writer = await asyncio.open_connection("127.0.0.1", 7070)
+    ip = '192.168.200.2'
+    reader, writer = await asyncio.open_connection(ip, 7070)
     channel = MessageChannel(reader, writer)
     client = DraftClient(channel)
+    # client = DraftClient(None)
 
     try:
         text = await client.decode_once()

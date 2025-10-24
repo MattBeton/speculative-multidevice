@@ -10,7 +10,7 @@ from mlx_lm.utils import load_model
 from mlx_lm.models.cache import make_prompt_cache
 
 SEED = 90
-TOP_K = 40
+TOP_K = 20
 
 def topk_sample_numpy(logits: np.array, k: int) -> tuple[int, np.array, np.array]:
     # Keep original shape for final output
