@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +24,10 @@ class GenTrace:
     chosen_token_ids: List[int]  # tokens we (client) sampled and appended
     per_step_topk: List[StepTopK]
     text: str
+    prefill_time: float          # time for first token generation (seconds)
+    decode_time: float           # total time for subsequent tokens (seconds)
+    prefill_tps: float           # prefill tokens per second
+    decode_tps: float            # decode tokens per second
 
 
 def _encode_prompt_ids(
@@ -137,8 +142,13 @@ def autoreg_one_step_vllm(
 
     eos_id = getattr(tok, "eos_token_id", None)
 
+    # Timing tracking
+    prefill_time = 0.0
+    decode_time = 0.0
+    prompt_len = len(prompt_ids)
+
     # 3) One-call-per-token loop
-    for _ in range(max_new_tokens):
+    for step_idx in range(max_new_tokens):
         sp = SamplingParams(
             max_tokens=1,
             logprobs=int(top_k),
@@ -146,7 +156,18 @@ def autoreg_one_step_vllm(
             top_p=1.0,             # do not truncate on server; we'll sample client-side
             detokenize=False,       # we track token ids and decode at the end
         )
+
+        # Time the generation step
+        start_time = time.perf_counter()
         out = llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sp)
+        elapsed = time.perf_counter() - start_time
+
+        # First step is prefill (processing prompt + first token), rest is decode
+        if step_idx == 0:
+            prefill_time = elapsed
+        else:
+            decode_time += elapsed
+
         # RequestOutput -> outputs[0] is the only sequence; logprobs for the single generated step at index 0
         seq_out = out[0].outputs[0]
         step_logprobs: Dict[int, object] = seq_out.logprobs[0]  # dict[token_id -> Logprob dataclass]
@@ -163,10 +184,33 @@ def autoreg_one_step_vllm(
             break
 
     text = tok.decode(chosen)
-    return GenTrace(chosen_token_ids=chosen, per_step_topk=per_step, text=text)
+
+    # Calculate TPS
+    # Prefill TPS: prompt tokens per second
+    prefill_tps = prompt_len / prefill_time if prefill_time > 0 else 0.0
+    # Decode TPS: generated tokens per second (excluding first token)
+    num_decode_tokens = len(chosen) - 1 if len(chosen) > 1 else 0
+    decode_tps = num_decode_tokens / decode_time if decode_time > 0 else 0.0
+
+    return GenTrace(
+        chosen_token_ids=chosen,
+        per_step_topk=per_step,
+        text=text,
+        prefill_time=prefill_time,
+        decode_time=decode_time,
+        prefill_tps=prefill_tps,
+        decode_tps=decode_tps,
+    )
 
 
 if __name__ == "__main__":
+    import logging
+    import os
+
+    # Reduce vLLM logging verbosity to minimize latency from logging overhead
+    os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+    logging.getLogger("vllm").setLevel(logging.ERROR)
+
     # Example usage
     MODEL = "meta-llama/Meta-Llama-3.2-3B"
     MODEL = "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B/snapshots/13afe5124825b4f3751f836b40dafda64c1ed062/"
@@ -180,7 +224,13 @@ if __name__ == "__main__":
         temperature=1.0,
         seed=90,
     )
-    print(trace.text)
+
+    # Display results
+    print(f"Generated text: {trace.text}\n")
+    print(f"Prefill TPS: {trace.prefill_tps:.2f} tokens/sec ({trace.prefill_time:.4f}s)")
+    print(f"Decode TPS: {trace.decode_tps:.2f} tokens/sec ({trace.decode_time:.4f}s)")
+    print(f"Total tokens generated: {len(trace.chosen_token_ids)}")
+
     # If you want to inspect the per-step top-k:
     # for i, step in enumerate(trace.per_step_topk[:3]):
     #     print(f"step {i} top-k ids:", step.token_ids[:10])
