@@ -1,5 +1,6 @@
 # speculative_client.py
 import asyncio
+import time
 from pathlib import Path
 from typing import List
 
@@ -71,6 +72,15 @@ class DraftClient:
         generated: List[int] = []
         last = prompt_last
 
+        # Timing accumulators
+        total_draft_time = 0.0
+        total_server_wait_time = 0.0
+        draft_iterations = 0
+
+        # Acceptance tracking
+        total_drafted = 0
+        total_accepted = 0
+
         # Speculative loop
         def _committed_len() -> int:
             return len(generated)
@@ -78,6 +88,7 @@ class DraftClient:
         with timer.measure("decode", _committed_len):
             while len(generated) < MAX_NEW_TOKENS:
                 # 1) Draft K tokens autoregressively
+                draft_start = time.perf_counter()
                 draft_toks = []
                 draft_topk_idx = []
                 draft_topk_vals = []
@@ -92,22 +103,42 @@ class DraftClient:
                     draft_topk_vals.append([float(v) for v in topk_vals[-1]])
                     cur = t  # advance locally
 
+                draft_end = time.perf_counter()
+                draft_time = draft_end - draft_start
+                total_draft_time += draft_time
+
+                # Track drafted tokens
+                total_drafted += len(draft_toks)
+
                 # 2) Verify on base (remote)
+                server_wait_start = time.perf_counter()
                 req = VerifyRequest(
                     draft_toks=draft_toks,
                     draft_topk_idx=draft_topk_idx,
                     draft_topk_vals=draft_topk_vals,
                 )
-                print(f'sending request {req}')
+                # print(f'sending request {req}')
                 await self._channel.send(req)
                 resp = await self._channel.recv()
-                print(f'received response {resp}')
+                server_wait_end = time.perf_counter()
+                server_wait_time = server_wait_end - server_wait_start
+                total_server_wait_time += server_wait_time
+
                 if not isinstance(resp, VerifyResponse):
                     raise RuntimeError(f"expected VerifyResponse, got {type(resp)!r}")
 
                 m = int(resp.accepted_len)
                 base_tok = resp.base_token
                 hit_eos = bool(resp.hit_eos)
+
+                # Track accepted tokens (only count draft tokens, not base fallback)
+                total_accepted += m
+
+                # Print iteration timing with acceptance info
+                iter_accept_rate = (m / len(draft_toks)) * 100 if len(draft_toks) > 0 else 0
+                print(f'[TIMING] Iteration {draft_iterations + 1}: draft={draft_time:.4f}s, server_wait={server_wait_time:.4f}s, accepted={m}/{len(draft_toks)} ({iter_accept_rate:.1f}%)')
+
+                draft_iterations += 1
 
                 accepted_tokens = draft_toks[:m]
                 base_appended = 0 if base_tok is None else 1
@@ -140,6 +171,23 @@ class DraftClient:
             _print_phase_summary("prefill", prefill.tokens, prefill.seconds)
         if decode:
             _print_phase_summary("decode", decode.tokens, decode.seconds)
+
+        # Print detailed timing breakdown
+        print(f"\n[CLIENT TIMING BREAKDOWN]")
+        print(f"  Total iterations: {draft_iterations}")
+        print(f"  Total draft time: {total_draft_time:.4f}s (avg: {total_draft_time/max(1, draft_iterations):.4f}s per iteration)")
+        print(f"  Total server wait time: {total_server_wait_time:.4f}s (avg: {total_server_wait_time/max(1, draft_iterations):.4f}s per iteration)")
+        print(f"  Draft time percentage: {100*total_draft_time/(total_draft_time + total_server_wait_time):.1f}%")
+        print(f"  Server wait percentage: {100*total_server_wait_time/(total_draft_time + total_server_wait_time):.1f}%")
+
+        # Print acceptance statistics
+        accept_rate = (total_accepted / total_drafted) * 100 if total_drafted > 0 else 0
+        print(f"\n[ACCEPTANCE METRICS]")
+        print(f"  Total drafted: {total_drafted} tokens")
+        print(f"  Total accepted: {total_accepted} tokens")
+        print(f"  Overall acceptance rate: {accept_rate:.1f}%")
+        print(f"  Avg drafted per iteration: {total_drafted/max(1, draft_iterations):.1f} tokens")
+        print(f"  Avg accepted per iteration: {total_accepted/max(1, draft_iterations):.1f} tokens")
 
         text = await run_mlx(self.model.decode, generated)
         return text

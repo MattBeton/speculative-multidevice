@@ -14,11 +14,12 @@
 #   past_kv + [last] + K drafted tokens, then slice the returned KV to keep
 #   only the committed portion (accepted + optional base fallback), *excluding*
 #   the previous 'last' (as in your MLX server).
-# - The base fallback token is sampled from the base model’s top-k distribution
+# - The base fallback token is sampled from the base model's top-k distribution
 #   at the position m (the first rejected step), same as your MLX server.
 
 import asyncio
 import os
+import time
 from typing import List, Optional, Tuple
 
 import torch
@@ -126,9 +127,16 @@ class HFVerifierSession:
         # Per-session RNG to make fallback sampling deterministic
         self._gen = GENERATORS["cuda" if DEVICE.type == "cuda" else "cpu"]
 
+        # Timing statistics
+        self.verify_iterations = 0
+        self.total_verify_time = 0.0
+
     async def reset(self) -> None:
         self._past = None
         self._last = None
+        # Reset timing stats
+        self.verify_iterations = 0
+        self.total_verify_time = 0.0
 
     @torch.no_grad()
     async def prefill(self, prompt: List[int]) -> None:
@@ -141,6 +149,8 @@ class HFVerifierSession:
 
     @torch.no_grad()
     async def verify(self, req: VerifyRequest) -> VerifyResponse:
+        verify_start = time.perf_counter()
+
         if self._last is None:
             raise RuntimeError("verify called before prefill")
 
@@ -156,6 +166,7 @@ class HFVerifierSession:
             past_key_values=self._past,
             attention_mask=attn,
         )
+
         # logits: (1, K+1, V) -> (K+1, V)
         logits = outputs.logits.squeeze(0).to(torch.float32)
         # Sample base tokens, and obtain per-row top-k for acceptance math
@@ -239,6 +250,13 @@ class HFVerifierSession:
         elif accepted > 0:
             self._last = int(draft_toks[accepted - 1])
         # else: no tokens committed → _last remains unchanged (rare edge case)
+        
+        verify_end = time.perf_counter()
+        verify_time = verify_end - verify_start
+        self.total_verify_time += verify_time
+        self.verify_iterations += 1
+
+        print(f"[SERVER TIMING] Verify iteration {self.verify_iterations}: forward pass took {verify_time:.4f}s")
 
         return VerifyResponse(accepted_len=int(accepted), base_token=base_token, hit_eos=bool(hit_eos))
 
@@ -267,6 +285,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             else:
                 raise RuntimeError(f"unhandled message type: {type(msg)!r}")
     finally:
+        # Print timing summary
+        if session.verify_iterations > 0:
+            print(f"\n[SERVER TIMING SUMMARY]")
+            print(f"  Total verify iterations: {session.verify_iterations}")
+            print(f"  Total verify forward pass time: {session.total_verify_time:.4f}s")
+            print(f"  Average time per verify: {session.total_verify_time/session.verify_iterations:.4f}s")
         await channel.close()
 
 
