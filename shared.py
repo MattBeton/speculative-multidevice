@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import typing as _t
 import functools
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -91,24 +92,6 @@ _TYPE_TO_NAME: Dict[Type[Message], str] = {
 }
 _NAME_TO_TYPE: Dict[str, Type[Message]] = {v: k for k, v in _TYPE_TO_NAME.items()}
 
-
-def encode_message(message: MessageType) -> bytes:
-    envelope = {"type": _TYPE_TO_NAME[type(message)], "payload": message.model_dump()}
-    return (json.dumps(envelope) + "\n").encode("utf-8")
-
-
-def decode_message(data: bytes) -> MessageType:
-    if not data:
-        raise ValueError("cannot decode empty payload")
-    envelope = json.loads(data)
-    msg_type = envelope.get("type")
-    payload = envelope.get("payload", {})
-    cls = _NAME_TO_TYPE.get(msg_type)
-    if cls is None:
-        raise ValueError(f"unknown message type: {msg_type!r}")
-    return cls.model_validate(payload)
-
-
 class MessageChannel:
     """Line-delimited JSON message transport."""
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -119,10 +102,23 @@ class MessageChannel:
         line = await self._reader.readline()
         if not line:
             return None
-        return decode_message(line)
+        # Inline decode (no external function names to shadow)
+        envelope = json.loads(line)
+        msg_type = envelope.get("type")
+        payload = envelope.get("payload", {})
+        cls = _NAME_TO_TYPE.get(msg_type)
+        if cls is None:
+            raise ValueError(f"unknown message type: {msg_type!r}")
+        return cls.model_validate(payload)
 
     async def send(self, message: MessageType) -> None:
-        self._writer.write(encode_message(message))
+        # Inline encode (no external function names to shadow)
+        msg_name = _TYPE_TO_NAME.get(type(message))
+        if msg_name is None:
+            raise ValueError(f"unregistered message type: {type(message)!r}")
+        envelope = {"type": msg_name, "payload": message.model_dump()}
+        data = (json.dumps(envelope) + "\n").encode("utf-8")
+        self._writer.write(data)
         await self._writer.drain()
 
     async def close(self) -> None:
