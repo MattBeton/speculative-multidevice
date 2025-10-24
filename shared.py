@@ -1,32 +1,40 @@
+# shared.py
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Type, Union
 
 try:
     import numpy as _np
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
+except ModuleNotFoundError:  # pragma: no cover
     _np = None
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+# ---------- MLX single-thread executor ----------
+# All MLX work runs on this single thread to avoid thread-safety gotchas.
+_MLX_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 
+async def run_mlx(func, *args, **kwargs):
+    """Run blocking MLX code on the dedicated single-thread executor."""
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(_MLX_EXEC, bound)
+
+
+# ---------- Wire messages ----------
 class Message(BaseModel):
-    """Base class for messages exchanged between client and server."""
-
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class ResetRequest(Message):
-    """Clear any per-sequence state on the verifier."""
-
     pass
 
 
 class PrefillRequest(Message):
-    """Send the initial prompt tokens to warm up caches."""
-
     prompt: list[int]
 
     @field_validator("prompt", mode="before")
@@ -37,9 +45,11 @@ class PrefillRequest(Message):
         return [int(v) for v in list(value)]
 
 
-class VerifyRequest(Message):
-    """Ask the verifier to accept or reject drafted tokens."""
+class PrefillResponse(Message):
+    ok: bool = True
 
+
+class VerifyRequest(Message):
     draft_toks: list[int]
     draft_topk_vals: list[list[float]]
     draft_topk_idx: list[list[int]]
@@ -65,39 +75,29 @@ class VerifyRequest(Message):
 
 
 class VerifyResponse(Message):
-    """Response indicating how many drafted tokens were accepted."""
+    accepted_len: int            # how many drafted tokens were accepted
+    base_token: Optional[int]    # the base fallback token (None if EOS hit in accepted draft)
+    hit_eos: bool                # whether an EOS was encountered among accepted tokens
 
-    accepted_len: int
 
-
-MessageType = Union[ResetRequest, PrefillRequest, VerifyRequest, VerifyResponse]
+MessageType = Union[ResetRequest, PrefillRequest, PrefillResponse, VerifyRequest, VerifyResponse]
 
 _TYPE_TO_NAME: Dict[Type[Message], str] = {
     ResetRequest: "reset",
     PrefillRequest: "prefill",
+    PrefillResponse: "prefill_response",
     VerifyRequest: "verify",
     VerifyResponse: "verify_response",
 }
-
 _NAME_TO_TYPE: Dict[str, Type[Message]] = {v: k for k, v in _TYPE_TO_NAME.items()}
 
 
 def encode_message(message: MessageType) -> bytes:
-    """Serialize a message to line-delimited JSON bytes."""
-
-    msg_type = _TYPE_TO_NAME.get(type(message))
-    if msg_type is None:
-        raise ValueError(f"unregistered message type: {type(message)!r}")
-    envelope = {
-        "type": msg_type,
-        "payload": message.model_dump(),
-    }
+    envelope = {"type": _TYPE_TO_NAME[type(message)], "payload": message.model_dump()}
     return (json.dumps(envelope) + "\n").encode("utf-8")
 
 
 def decode_message(data: bytes) -> MessageType:
-    """Deserialize a single line of JSON into a message instance."""
-
     if not data:
         raise ValueError("cannot decode empty payload")
     envelope = json.loads(data)
@@ -110,8 +110,7 @@ def decode_message(data: bytes) -> MessageType:
 
 
 class MessageChannel:
-    """Line-delimited JSON message transport helper."""
-
+    """Line-delimited JSON message transport."""
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self._reader = reader
         self._writer = writer
