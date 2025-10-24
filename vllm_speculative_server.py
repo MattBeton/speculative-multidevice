@@ -14,25 +14,28 @@ from shared import (
     MessageChannel,
     PrefillRequest,
     PrefillResponse,
-    ResetRequest,
+    PrefillBatchRequest,
+    PrefillBatchResponse,
     VerifyRequest,
     VerifyResponse,
+    VerifyBatchRequest,
+    VerifyBatchResponse,
+    VerifyResponseItem,
+    ResetRequest,
 )
 
 # ---------------- Configuration ----------------
-# Use your local snapshot path:
 BASE_MODEL = "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95/"
 HOST = "0.0.0.0"
 PORT = 7070
 
 SEED = 90
 BASE_TEMP = 1.0
-DEFAULT_TOPK = 40  # used only if we can't infer top-k from the draft row
+DEFAULT_TOPK = 20  # used only if we can't infer top-k from the draft row
 
 
 # ----------------- Utilities -------------------
 def _normalize_from_logprobs(logps: np.ndarray) -> np.ndarray:
-    """Renormalize a (subset) of logprobs to probabilities."""
     m = np.max(logps)
     probs = np.exp(logps - m)
     s = probs.sum()
@@ -44,11 +47,6 @@ def _draft_lp_from_row(
     d_vals: List[float],
     tok_id: int,
 ) -> Tuple[float, int]:
-    """
-    Convert draft top-k 'values' into a normalized log-prob over that row,
-    then return (logprob_of_tok, index).
-    NOTE: Treats incoming values as logits; applies log-softmax over the row.
-    """
     if not d_ids:
         return float("-inf"), -1
     try:
@@ -64,10 +62,6 @@ def _draft_lp_from_row(
 
 
 def _sample_from_lp_dict(lp_dict: Dict[int, object], rng: np.random.Generator) -> int:
-    """
-    Sample a token id from vLLM logprob dict (token_id -> Logprob dataclass with .logprob).
-    We renormalize over the subset vLLM provides (top-k + chosen).
-    """
     items = [(int(t), float(o.logprob)) for t, o in lp_dict.items()]
     items.sort(key=lambda kv: kv[1], reverse=True)
     ids = np.array([t for t, _ in items], dtype=np.int64)
@@ -78,13 +72,8 @@ def _sample_from_lp_dict(lp_dict: Dict[int, object], rng: np.random.Generator) -
 
 
 def _extract_prompt_rows(req_out, k: int) -> List[Optional[Dict[int, object]]]:
-    """
-    Extract vLLM's prompt_logprobs (teacher-forced) for each prompt token.
-    Returns the last K rows (corresponding to the drafted tokens we appended).
-    """
     prompt_rows = getattr(req_out, "prompt_logprobs", None)
     if prompt_rows is None:
-        # Older variants sometimes attached to first sequence; try that:
         if req_out.outputs:
             prompt_rows = getattr(req_out.outputs[0], "prompt_logprobs", None)
     if prompt_rows is None:
@@ -92,73 +81,84 @@ def _extract_prompt_rows(req_out, k: int) -> List[Optional[Dict[int, object]]]:
     return prompt_rows[-k:] if k > 0 else []
 
 
-# ----------------- Verifier Session -------------------
-class VerifierSession:
-    """
-    vLLM-based verifier with MLX-identical commit/rollback semantics:
-      - Keep state as _prefix (all committed tokens EXCEPT last) and _last (the trailing token).
-      - On verify, build prompt = _prefix + [_last] + draft_toks and call vLLM ONCE with:
-          prompt_logprobs=K, logprobs=K, max_tokens=1, detokenize=False
-      - Acceptance at position i uses teacher-forced base logprob at row i vs. draft row.
-      - Fallback token:
-          * If reject at i: sample from prompt_logprobs row i (base distribution at that position).
-          * If accept all: sample from generated step's logprobs[0].
-      - Commit state exactly like the MLX server, moving tokens from 'last' into 'prefix'
-        and setting a new 'last'.
-    """
+# ----------------- Multi-Stream Verifier -------------------
+class _StreamState:
+    __slots__ = ("prefix", "last", "eos")
+    def __init__(self, eos: Optional[int]):
+        self.prefix: List[int] = []
+        self.last: Optional[int] = None
+        self.eos: Optional[int] = eos
 
+
+class Verifier:
+    """
+    vLLM-based verifier with MLX-identical commit/rollback semantics, now for many
+    concurrent streams. Each stream keeps (prefix, last) independently.
+    """
     def __init__(self, llm: LLM, tok: PreTrainedTokenizer):
         self.llm = llm
         self.tok = tok
-        self._prefix: List[int] = []
-        self._last: Optional[int] = None
-        self._eos: Optional[int] = getattr(tok, "eos_token_id", None)
+        self._states: Dict[str, _StreamState] = {}
         self._rng = np.random.default_rng(SEED)
+        self._default_id = "_default"
+
+    def _get_or_create(self, sid: str) -> _StreamState:
+        s = self._states.get(sid)
+        if s is None:
+            s = _StreamState(getattr(self.tok, "eos_token_id", None))
+            self._states[sid] = s
+        return s
 
     async def reset(self) -> None:
-        self._prefix = []
-        self._last = None
+        self._states.clear()
 
-    async def prefill(self, prompt: List[int]) -> None:
+    async def prefill_single(self, prompt: List[int], sid: Optional[str] = None) -> None:
         if not prompt:
             raise ValueError("empty prompt")
-        # Mirror MLX prefill: cache/prefix = all but last; 'last' = final prompt token
-        self._prefix = [int(x) for x in prompt[:-1]]
-        self._last = int(prompt[-1])
+        sid = sid or self._default_id
+        st = self._get_or_create(sid)
+        st.prefix = [int(x) for x in prompt[:-1]]
+        st.last = int(prompt[-1])
 
-    async def verify(self, req: VerifyRequest) -> VerifyResponse:
-        if self._last is None:
-            raise RuntimeError("verify called before prefill")
+    async def prefill_batch(self, items: List[Tuple[str, List[int]]]) -> None:
+        for sid, prompt in items:
+            await self.prefill_single(prompt, sid=sid)
 
-        draft_toks = [int(t) for t in req.draft_toks]
-        K = len(draft_toks)
-        if K == 0:
-            # Pure base step: ask base for one token after 'last'
-            prompt_ids = self._prefix + [self._last]
-            sp = SamplingParams(
-                max_tokens=1, logprobs=DEFAULT_TOPK, temperature=BASE_TEMP, top_p=1.0, detokenize=False, seed=SEED
-            )
-            loop = asyncio.get_running_loop()
-            out = (await loop.run_in_executor(
-                None, lambda: self.llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sp)
-            ))[0]
-            seq = out.outputs[0]
-            gen_row = seq.logprobs[0] if seq.logprobs else None
-            base_token = _sample_from_lp_dict(gen_row, self._rng) if gen_row else int(seq.token_ids[0])
+    async def verify_single(self, draft_toks: List[int], draft_rows: Tuple[List[List[int]], List[List[float]]], sid: Optional[str] = None):
+        """Legacy path wrapper; returns (accepted_len, base_token, hit_eos)."""
+        sid = sid or self._default_id
+        resp = await self.verify_batch([(sid, draft_toks, draft_rows)])
+        item = resp[0]
+        return item.accepted_len, item.base_token, item.hit_eos
 
-            # Commit MLX-style: prefix += [last], last = base_token
-            self._prefix.append(self._last)
-            self._last = int(base_token)
-            return VerifyResponse(accepted_len=0, base_token=int(base_token), hit_eos=False)
+    async def verify_batch(self, batch: List[Tuple[str, List[int], Tuple[List[List[int]], List[List[float]]]]]) -> List[VerifyResponseItem]:
+        """
+        batch: list of (stream_id, draft_toks, (draft_topk_idx, draft_topk_vals))
+        Returns one VerifyResponseItem per input item, same order.
+        """
+        # Build prompts
+        prompts: List[TokensPrompt] = []
+        Ks: List[int] = []
+        sids: List[str] = []
+        base_topk_candidates: List[int] = []
 
-        # Infer base top-k from draft row length
-        base_topk = len(req.draft_topk_idx[0]) if req.draft_topk_idx and len(req.draft_topk_idx[0]) > 0 else DEFAULT_TOPK
+        # Collect for a single batched vLLM call
+        for sid, draft_toks, (d_idx, _d_vals) in batch:
+            st = self._get_or_create(sid)
+            if st.last is None:
+                raise RuntimeError(f"verify called before prefill for stream {sid!r}")
+            K = len(draft_toks)
+            Ks.append(K)
+            sids.append(sid)
+            base_topk_candidates.append(len(d_idx[0]) if (K > 0 and len(d_idx) > 0 and len(d_idx[0]) > 0) else 0)
+            prompt_ids = st.prefix + [st.last] + draft_toks
+            prompts.append(TokensPrompt(prompt_token_ids=prompt_ids))
 
-        # Single vLLM call for the whole K-chunk: teacher-force the draft tokens and get the next-token row.
-        verify_prompt = self._prefix + [self._last] + draft_toks
+        max_k = max(Ks) if Ks else 0
+        base_topk = max(max(base_topk_candidates), DEFAULT_TOPK)
         sp = SamplingParams(
             max_tokens=1,
-            prompt_logprobs=int(base_topk),
+            prompt_logprobs=int(base_topk if max_k > 0 else 1),  # keep >=1 for simplicity
             logprobs=int(base_topk),
             temperature=BASE_TEMP,
             top_p=1.0,
@@ -166,93 +166,88 @@ class VerifierSession:
             seed=SEED,
         )
         loop = asyncio.get_running_loop()
-        req_out = (await loop.run_in_executor(
-            None, lambda: self.llm.generate([TokensPrompt(prompt_token_ids=verify_prompt)], sp)
-        ))[0]
+        outs = await loop.run_in_executor(None, lambda: self.llm.generate(prompts, sp))
 
-        prompt_rows = _extract_prompt_rows(req_out, K)  # last K rows correspond to drafted tokens
-        seq = req_out.outputs[0]
-        gen_row = seq.logprobs[0] if seq.logprobs else None
+        results: List[VerifyResponseItem] = []
 
-        accepted = 0
-        hit_eos = False
-        base_token: Optional[int] = None
+        for (sid, draft_toks, (d_idx_rows, d_val_rows)), out, K in zip(batch, outs, Ks):
+            st = self._get_or_create(sid)
 
-        # Walk the drafted tokens left-to-right
-        for i, tok in enumerate(draft_toks):
-            row = prompt_rows[i] or {}
-            # Base logprob for drafted token at position i (teacher-forced)
-            base_lp = float(row[tok].logprob) if tok in row else float("-inf")
+            if K == 0:
+                seq = out.outputs[0]
+                gen_row = seq.logprobs[0] if seq.logprobs else None
+                base_token = _sample_from_lp_dict(gen_row, self._rng) if gen_row else int(seq.token_ids[0])
 
-            # Draft "logprob" over its own row (normalize draft's top-k values as logits)
-            d_ids = [int(x) for x in req.draft_topk_idx[i]]
-            d_vals = [float(x) for x in req.draft_topk_vals[i]]
-            draft_lp, _ = _draft_lp_from_row(d_ids, d_vals, tok)
+                # Commit MLX-style
+                st.prefix.append(st.last)
+                st.last = int(base_token)
+                results.append(VerifyResponseItem(stream_id=sid, accepted_len=0, base_token=int(base_token), hit_eos=False))
+                continue
 
-            # Accept if base_lp >= draft_lp; otherwise accept w.p. exp(base_lp - draft_lp)
-            if base_lp == float("-inf"):
-                # Reject immediately; fallback from THIS position's base distribution
-                base_token = _sample_from_lp_dict(row, self._rng) if row else None
-                break
+            prompt_rows = _extract_prompt_rows(out, K)
+            seq = out.outputs[0]
+            gen_row = seq.logprobs[0] if seq.logprobs else None
 
-            if base_lp >= draft_lp:
-                accept = True
+            accepted = 0
+            hit_eos = False
+            base_token: Optional[int] = None
+
+            for i, tok in enumerate(draft_toks):
+                # Teacher-forced base distribution at this position
+                row = prompt_rows[i] or {}
+                base_lp = float(row[tok].logprob) if tok in row else float("-inf")
+
+                d_ids = [int(x) for x in d_idx_rows[i]] if i < len(d_idx_rows) else []
+                d_vals = [float(x) for x in d_val_rows[i]] if i < len(d_val_rows) else []
+                draft_lp, _ = _draft_lp_from_row(d_ids, d_vals, tok)
+
+                if base_lp == float("-inf"):
+                    base_token = _sample_from_lp_dict(row, self._rng) if row else None
+                    break
+
+                if base_lp >= draft_lp:
+                    accept = True
+                else:
+                    u = float(self._rng.uniform(0.0, 1.0))
+                    accept = (u <= np.exp(base_lp - draft_lp))
+
+                if not accept:
+                    base_token = _sample_from_lp_dict(row, self._rng)
+                    break
+
+                accepted += 1
+
+                if (st.eos is not None) and (tok == st.eos):
+                    hit_eos = True
+                    base_token = None
+                    break
+
+            if (accepted == K) and (not hit_eos):
+                base_token = _sample_from_lp_dict(gen_row, self._rng) if gen_row else int(seq.token_ids[0])
+
+            # Commit MLX-style to stream state
+            if hit_eos:
+                st.prefix.extend([st.last] + draft_toks[:accepted - 1])
+                st.last = draft_toks[accepted - 1]
+                results.append(VerifyResponseItem(stream_id=sid, accepted_len=accepted, base_token=None, hit_eos=True))
             else:
-                u = float(self._rng.uniform(0.0, 1.0))
-                accept = (u <= np.exp(base_lp - draft_lp))
+                if base_token is not None:
+                    st.prefix.extend([st.last] + draft_toks[:accepted])
+                    st.last = int(base_token)
+                else:
+                    if accepted > 0:
+                        st.prefix.extend([st.last] + draft_toks[:accepted - 1])
+                        st.last = draft_toks[accepted - 1]
+                results.append(VerifyResponseItem(stream_id=sid, accepted_len=accepted, base_token=base_token, hit_eos=False))
 
-            if not accept:
-                base_token = _sample_from_lp_dict(row, self._rng)
-                break
-
-            # Accepted this drafted token
-            accepted += 1
-
-            # EOS inside accepted draft
-            if self._eos is not None and tok == self._eos:
-                hit_eos = True
-                base_token = None  # No fallback when EOS is in accepted draft
-                break
-
-        # If we accepted all K and didn't hit EOS, fallback comes from the generated step
-        if (accepted == K) and (not hit_eos):
-            if gen_row:
-                base_token = _sample_from_lp_dict(gen_row, self._rng)
-            else:
-                # If logprobs missing (unlikely), fall back to vLLM's chosen token
-                base_token = int(seq.token_ids[0])
-
-        # ---------------- Commit MLX-style ----------------
-        if hit_eos:
-            # Accepted up to and including EOS among drafted tokens:
-            # prefix += [last] + accepted[:-1], last = accepted[-1] (EOS)
-            self._prefix.extend([self._last] + draft_toks[:accepted - 1])
-            self._last = draft_toks[accepted - 1]
-            return VerifyResponse(accepted_len=accepted, base_token=None, hit_eos=True)
-
-        # Not EOS:
-        if base_token is not None:
-            # Fallback appended.
-            # prefix += [last] + accepted, last = base_token
-            self._prefix.extend([self._last] + draft_toks[:accepted])
-            self._last = int(base_token)
-        else:
-            # No fallback (should only happen if K>0 and accepted>0 but hit_eos=True handled above).
-            # For completeness, mirror MLX: prefix += [last] + accepted[:-1], last = accepted[-1]
-            if accepted > 0:
-                self._prefix.extend([self._last] + draft_toks[:accepted - 1])
-                self._last = draft_toks[accepted - 1]
-            # If accepted == 0 and no base_token, do nothing.
-
-        return VerifyResponse(accepted_len=accepted, base_token=base_token, hit_eos=False)
+        return results
 
 
 # -------------------- Server plumbing --------------------
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, llm: LLM, tok: PreTrainedTokenizer) -> None:
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, verifier: Verifier) -> None:
     peer = writer.get_extra_info("peername")
     print(f"client connected: {peer}")
     channel = MessageChannel(reader, writer)
-    session = VerifierSession(llm, tok)
     try:
         while True:
             msg = await channel.recv()
@@ -261,13 +256,29 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 break
 
             if isinstance(msg, ResetRequest):
-                await session.reset()
+                await verifier.reset()
+
             elif isinstance(msg, PrefillRequest):
-                await session.prefill([int(x) for x in msg.prompt])
+                await verifier.prefill_single(msg.prompt)
                 await channel.send(PrefillResponse(ok=True))
+
             elif isinstance(msg, VerifyRequest):
-                resp = await session.verify(msg)
-                await channel.send(resp)
+                accepted, base_tok, hit = await verifier.verify_single(
+                    draft_toks=msg.draft_toks,
+                    draft_rows=(msg.draft_topk_idx, msg.draft_topk_vals),
+                )
+                await channel.send(VerifyResponse(accepted_len=accepted, base_token=base_tok, hit_eos=hit))
+
+            elif isinstance(msg, PrefillBatchRequest):
+                await verifier.prefill_batch([(it.stream_id, it.prompt) for it in msg.items])
+                await channel.send(PrefillBatchResponse(ok=True, count=len(msg.items)))
+
+            elif isinstance(msg, VerifyBatchRequest):
+                res_items = await verifier.verify_batch([
+                    (it.stream_id, it.draft_toks, (it.draft_topk_idx, it.draft_topk_vals)) for it in msg.items
+                ])
+                await channel.send(VerifyBatchResponse(items=res_items))
+
             else:
                 raise RuntimeError(f"unhandled message type: {type(msg)!r}")
     finally:
@@ -279,7 +290,8 @@ async def main() -> None:
     llm = LLM(model=BASE_MODEL, trust_remote_code=True, enforce_eager=True, max_seq_len_to_capture=0)
     tok: PreTrainedTokenizer = llm.get_tokenizer()
 
-    server = await asyncio.start_server(lambda r, w: handle_client(r, w, llm, tok), HOST, PORT)
+    verifier = Verifier(llm, tok)
+    server = await asyncio.start_server(lambda r, w: handle_client(r, w, verifier), HOST, PORT)
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
     print(f"Verifier (vLLM) listening on {addrs}")
     async with server:

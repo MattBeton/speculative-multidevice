@@ -6,7 +6,7 @@ import typing as _t
 import functools
 import json
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional, Type, Union
+from typing import Any, Dict, Optional, Type, Union, List
 
 try:
     import numpy as _np
@@ -32,9 +32,11 @@ class Message(BaseModel):
 
 
 class ResetRequest(Message):
+    """Reset whole session on the server (clears all stream states)."""
     pass
 
 
+# --------- SINGLE (legacy) ---------
 class PrefillRequest(Message):
     prompt: list[int]
 
@@ -81,7 +83,76 @@ class VerifyResponse(Message):
     hit_eos: bool                # whether an EOS was encountered among accepted tokens
 
 
-MessageType = Union[ResetRequest, PrefillRequest, PrefillResponse, VerifyRequest, VerifyResponse]
+# --------- BATCH (new) ---------
+class PrefillItem(Message):
+    stream_id: str
+    prompt: list[int]
+
+    @field_validator("prompt", mode="before")
+    @classmethod
+    def _ensure_list(cls, value: Any) -> list[int]:
+        if _np is not None and isinstance(value, _np.ndarray):
+            return value.astype(int).tolist()
+        return [int(v) for v in list(value)]
+
+
+class PrefillBatchRequest(Message):
+    items: List[PrefillItem]
+
+
+class PrefillBatchResponse(Message):
+    ok: bool = True
+    count: int = 0
+
+
+class VerifyItem(Message):
+    stream_id: str
+    draft_toks: list[int]
+    draft_topk_vals: list[list[float]]
+    draft_topk_idx: list[list[int]]
+
+    @field_validator("draft_toks", mode="before")
+    @classmethod
+    def _ensure_tokens(cls, value: Any) -> list[int]:
+        if _np is not None and isinstance(value, _np.ndarray):
+            return value.astype(int).tolist()
+        return [int(v) for v in list(value)]
+
+    @field_validator("draft_topk_vals", mode="before")
+    @classmethod
+    def _ensure_vals(cls, value: Any) -> list[list[float]]:
+        rows = value.tolist() if (_np is not None and isinstance(value, _np.ndarray)) else list(value)
+        return [[float(v) for v in row] for row in rows]
+
+    @field_validator("draft_topk_idx", mode="before")
+    @classmethod
+    def _ensure_idx(cls, value: Any) -> list[list[int]]:
+        rows = value.tolist() if (_np is not None and isinstance(value, _np.ndarray)) else list(value)
+        return [[int(v) for v in row] for row in rows]
+
+
+class VerifyResponseItem(Message):
+    stream_id: str
+    accepted_len: int
+    base_token: Optional[int]
+    hit_eos: bool
+
+
+class VerifyBatchRequest(Message):
+    items: List[VerifyItem]
+
+
+class VerifyBatchResponse(Message):
+    items: List[VerifyResponseItem]
+
+
+MessageType = Union[
+    ResetRequest,
+    PrefillRequest, PrefillResponse,
+    VerifyRequest, VerifyResponse,
+    PrefillBatchRequest, PrefillBatchResponse,
+    VerifyBatchRequest, VerifyBatchResponse,
+]
 
 _TYPE_TO_NAME: Dict[Type[Message], str] = {
     ResetRequest: "reset",
@@ -89,6 +160,10 @@ _TYPE_TO_NAME: Dict[Type[Message], str] = {
     PrefillResponse: "prefill_response",
     VerifyRequest: "verify",
     VerifyResponse: "verify_response",
+    PrefillBatchRequest: "prefill_batch",
+    PrefillBatchResponse: "prefill_batch_response",
+    VerifyBatchRequest: "verify_batch",
+    VerifyBatchResponse: "verify_batch_response",
 }
 _NAME_TO_TYPE: Dict[str, Type[Message]] = {v: k for k, v in _TYPE_TO_NAME.items()}
 
@@ -102,7 +177,6 @@ class MessageChannel:
         line = await self._reader.readline()
         if not line:
             return None
-        # Inline decode (no external function names to shadow)
         envelope = json.loads(line)
         msg_type = envelope.get("type")
         payload = envelope.get("payload", {})
@@ -112,7 +186,6 @@ class MessageChannel:
         return cls.model_validate(payload)
 
     async def send(self, message: MessageType) -> None:
-        # Inline encode (no external function names to shadow)
         msg_name = _TYPE_TO_NAME.get(type(message))
         if msg_name is None:
             raise ValueError(f"unregistered message type: {type(message)!r}")
