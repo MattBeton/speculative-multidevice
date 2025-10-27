@@ -4,6 +4,8 @@ import time
 import os
 import numpy as np
 
+from gemlite.helper import *
+
 def _pad_or_repeat_to_len(ids, target_len):
     if len(ids) == 0:
         ids = [1]
@@ -76,6 +78,47 @@ def _pick_torch_dtype(arg):
     if arg == "bf16": return torch.bfloat16
     return None  # auto
 
+
+def patch_model(model, device, processor, skip_modules=[]):
+    #Loadd HQQLinear when needed
+    if(processor in [A16Wn]):
+        from hqq.core.quantize import HQQLinear
+    else:
+        class _NoHQQ: pass
+        HQQLinear = _NoHQQ
+
+    #Name modules
+    for name, module in model.named_modules():
+        module.name = name
+
+    #Patching fct
+    def _patching_fct(layer, device, skip_modules):
+        layer = layer.to(device, non_blocking=True)
+        if(any(s in layer.name for s in skip_modules)):
+            return layer
+        else:
+            if(isinstance(layer, torch.nn.Linear)):
+                return processor(device=device).from_linear(layer)
+            elif(isinstance(layer, HQQLinear)):
+                return processor(device=device).from_hqqlinear(layer)
+            else:
+                return layer
+
+    #Replaces linear layers
+    def _patch_linearlayers(model, fct, device, skip_modules):
+        for name, layer in model.named_children():
+            if isinstance(layer, (torch.nn.Linear, HQQLinear)):
+                setattr(model, name, fct(layer, device, skip_modules))
+            else:
+                _patch_linearlayers(layer, fct, device, skip_modules)
+
+    #Apply patch
+    _patch_linearlayers(model, _patching_fct, device, skip_modules)
+
+    #Clean-up
+    torch.cuda.empty_cache()
+    gc.collect()
+
 def run_hf(model_id, b, n, k, steps, warmup, prompt, dtype_arg="auto", flash=False, device="cuda"):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -97,11 +140,11 @@ def run_hf(model_id, b, n, k, steps, warmup, prompt, dtype_arg="auto", flash=Fal
     ).to(device)
     model.eval()
 
+    patch_model(model, 'cuda:0', processor=A8W8_INT8_dynamic, skip_modules=['lm_head'])
 
     attn_impl = getattr(model.config, "_attn_implementation", None)
     print("attn_impl =", attn_impl)  # should be 'flash_attention_2'
-    # from transformers.models.llama.modeling_llama import LlamaFlashAttention2
-    # print(isinstance(model.model.layers[0].self_attn, LlamaFlashAttention2))
+    print(f'{type(model.model.layers[0].self_attn)=}')
 
     prefix, verify = _build_prefix_and_verify_ids(tok, b, n, k, prompt)
     prefix_t = torch.tensor(prefix, dtype=torch.long, device=device)  # (B,N)
@@ -142,86 +185,81 @@ def _vllm_dtype(arg: str) -> str:
 def run_vllm(model_id, b, n, k, steps, warmup, prompt,
              dtype="auto", gpu_mem=0.95, enable_prefix_caching=True,
              tp_size=1, enforce_eager=False, disable_cudagraph=False, max_model_len=None):
-    # vLLM does prefill on the entire prompt. We rely on Automatic Prefix Caching:
-    # 1) prefill once with (B,N) and generate 1 token to ensure the KV gets captured.
-    # 2) for each step, call generate with (B,N+K) and max_tokens=0 (if supported),
-    #    so only the K-token suffix is computed thanks to prefix cache reuse.
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
-    import torch
+    import numpy as np, time, os
+    import os
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
-    # More verbose logs from child processes
-    os.environ.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
-    os.environ.setdefault("VLLM_ENGINE_LOGGING_LEVEL", "DEBUG")
+    llm = LLM(
+        model=model_id,
+        trust_remote_code=True,
+        dtype=_vllm_dtype(dtype),
+        gpu_memory_utilization=0.90,        # leave scratch headroom
+        enable_prefix_caching=True,
+        tensor_parallel_size=int(tp_size),
+        enforce_eager=bool(enforce_eager),
+        # Optional batch caps if memory is still tight:
+        # max_num_batched_tokens=2048,
+        # max_num_seqs=64,
+    )
 
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<not-set>")
-    print(f"\n[vLLM] model: {model_id}")
-    print(f"[vLLM] dtype={dtype}  gpu_mem={gpu_mem:.2f}  prefix_cache={enable_prefix_caching}  tp={tp_size}")
-    print(f"[vLLM] CUDA_VISIBLE_DEVICES={visible}  torch.cuda.device_count()={torch.cuda.device_count()}")
-
-    try:
-        llm = LLM(
-            model=model_id,
-            trust_remote_code=True,
-            dtype=_vllm_dtype(dtype),
-            gpu_memory_utilization=float(gpu_mem),
-            enable_prefix_caching=bool(enable_prefix_caching),
-            tensor_parallel_size=int(tp_size),
-            # Make startup more robust:
-            enforce_eager=bool(enforce_eager),
-        )
-    except Exception as e:
-        print("[vLLM] Engine init failed. Hints:")
-        print("  • Try: CUDA_VISIBLE_DEVICES=0  (or set --tp-size 1)")
-        print("  • Add: --enforce-eager  --no-cudagraph")
-        print("  • If in Docker: use --shm-size 8g  --ipc=host")
-        print("  • Ensure flash-attn matches your GPU arch, or just run without it.")
-        raise
     tok = llm.get_tokenizer()
 
-    prefix, verify = _build_prefix_and_verify_ids(tok, b, n, k, prompt)
-
-    # Build B prompts for prefill warmup (prefix only)
+    # Build prefix once
+    prefix, _ = _build_prefix_and_verify_ids(tok, b, n, k, prompt)
     prefill_prompts = [TokensPrompt(prompt_token_ids=prefix[i].tolist()) for i in range(b)]
-    sp_prefill = SamplingParams(max_tokens=1, detokenize=False, temperature=0.0)
 
+    # Warm up: compute + cache N (generate 1 token so KV is fully captured)
+    sp1 = SamplingParams(max_tokens=1, detokenize=False, temperature=0.0)
     t0 = time.perf_counter()
-    _ = llm.generate(prefill_prompts, sp_prefill)  # ensures prefix KV is cached
+    _ = llm.generate(prefill_prompts, sp1)
     t_prefill = time.perf_counter() - t0
 
-    # Verify-step prompts = prefix + K tokens (identical prefix to trigger caching)
-    times = []
-    # Prefer no decode work: max_tokens=0 (supported in newer vLLM); fall back to 1 if needed.
-    try_zero = True
+    # ---------- NEW: baseline-subtract 1-token decode ----------
+    # Greedy decode to minimize sampler overhead; also consider env fixes below.
+    sp_decode = SamplingParams(max_tokens=1, detokenize=False, temperature=0.0, top_k=1, top_p=1.0)
+
+    # 1) Baseline: decode from cached prefix only (no verify suffix)
+    base_times = []
     for i in range(warmup + steps):
-        prompts = [
-            TokensPrompt(prompt_token_ids=np.concatenate([prefix[j], verify[j]]).astype(int).tolist())
-            for j in range(b)
-        ]
         t1 = time.perf_counter()
-        try:
-            if try_zero:
-                sp = SamplingParams(max_tokens=0, detokenize=False)  # "prompt-only" compute
-                _ = llm.generate(prompts, sp)
-            else:
-                sp = SamplingParams(max_tokens=1, detokenize=False, temperature=0.0)
-                _ = llm.generate(prompts, sp)
-        except Exception:
-            # Older vLLM may not accept max_tokens=0; switch to +1 decode fallback
-            try_zero = False
-            sp = SamplingParams(max_tokens=1, detokenize=False, temperature=0.0)
-            _ = llm.generate(prompts, sp)
+        _ = llm.generate(prefill_prompts, sp_decode)
         dt = time.perf_counter() - t1
         if i >= warmup:
-            times.append(dt)
+            base_times.append(dt)
+    baseline_decode = float(np.mean(base_times)) if base_times else 0.0
 
-    avg = float(np.mean(times)) if times else 0.0
-    tps = (b * k) / avg if avg > 0 else float("inf")
-    extra = "" if try_zero else "  (+1 decode included)"
+    # Helper to make a CHANGING K-token suffix each step
+    def make_verify_prompts(i):
+        ch = chr(ord('a') + (i % 26))
+        v_ids = tok.encode(ch, add_special_tokens=False) or [tok.eos_token_id]
+        v_row = _pad_or_repeat_to_len(v_ids, k)
+        verify = np.tile(np.array(v_row, dtype=np.int32)[None, :], (b, 1))
+        return [TokensPrompt(prompt_token_ids=np.concatenate([prefix[j], verify[j]]).tolist())
+                for j in range(b)]
+
+    # 2) Verify+decode: prefix + K changing tokens
+    v_times = []
+    for i in range(warmup + steps):
+        prompts = make_verify_prompts(i)
+        t1 = time.perf_counter()
+        _ = llm.generate(prompts, sp_decode)
+        dt = time.perf_counter() - t1
+        if i >= warmup:
+            v_times.append(dt)
+    avg_verify_plus_decode = float(np.mean(v_times)) if v_times else 0.0
+
+    verify_only = max(avg_verify_plus_decode - baseline_decode, 1e-9)
+    tps = (b * k) / verify_only
     print(f"[vLLM] prefill: N={n}, B={b}   time={t_prefill*1000:.1f} ms")
-    print(f"[vLLM] verify:  K={k}, B={b}, steps={steps}, warmup={warmup}{extra}")
-    print(f"[vLLM] avg step: {avg*1000:.2f} ms   → {tps:.1f} tok/s (B×K per step)")
-    return {"backend": "vllm", "avg_step_s": avg, "tok_per_sec": tps, "prefill_s": t_prefill, "includes_decode": (not try_zero)}
+    print(f"[vLLM] verify-only: K={k}, B={b}, steps={steps}, warmup={warmup}  (1-token decode baseline subtracted)")
+    print(f"[vLLM] avg step: {verify_only*1000:.2f} ms   → {tps:.1f} tok/s (B×K per step)")
+    return {"backend": "vllm", "avg_step_s": verify_only, "tok_per_sec": tps, "prefill_s": t_prefill, "includes_decode": False}
+
+
+
 
 # --------------------------------- CLI ---------------------------------
 def main():
@@ -253,7 +291,7 @@ def main():
 
     # vLLM
     v = sub.add_parser("vllm", help="Run vLLM (CUDA) benchmark with prefix caching")
-    v.add_argument("--model-id", type=str, required=True)
+    v.add_argument("--model-id", type=str, default='meta-llama/Llama-3.2-3B-Instruct')
     v.add_argument("-b", "--batch", type=int, default=8)
     v.add_argument("-n", "--n-prefix", type=int, default=2048)
     v.add_argument("-k", "--k-verify", type=int, default=8)
@@ -262,7 +300,6 @@ def main():
     v.add_argument("--prompt", type=str, default="Why is the sky blue? ")
     v.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bfloat16", "float16", "float32"])
     v.add_argument("--gpu-mem", type=float, default=0.95)
-    v.add_argument("--enable-prefix-caching", action="store_true")
     v.add_argument("--tp-size", type=int, default=1, help="tensor_parallel_size (set 1 first)")
     v.add_argument("--enforce-eager", action="store_true", help="Force eager (avoid cudagraph pitfalls)")
     v.add_argument("--no-cudagraph", action="store_true", help="Set max_seq_len_to_capture=0")
@@ -313,7 +350,7 @@ def main():
 
     elif args.mode == "vllm":
         run_vllm(args.model_id, args.batch, args.n_prefix, args.k_verify, args.steps, args.warmup,
-                 args.prompt, args.dtype, args.gpu_mem, args.enable_prefix_caching,
+                 args.prompt, args.dtype, args.gpu_mem, True,
                  args.tp_size, args.enforce_eager, args.no_cudagraph, args.max_model_len)
 
     elif args.mode == "both":
