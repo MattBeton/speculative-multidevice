@@ -1,36 +1,3 @@
-# bench_verify.py
-# Benchmarks "spec verify" forwards: given a prefilled KV of length N for each
-# of B sequences, feed K tokens per sequence at once (teacher-forced) and time
-# the forward pass. Repeats for S steps and reports average.
-#
-# Backends:
-#   - MLX  (Apple Silicon)
-#   - HF/Transformers (CUDA)
-#   - vLLM (CUDA; uses Automatic Prefix Caching to avoid re-prefill of N)
-#
-# Examples:
-#   # MLX on Mac:
-#   python bench_verify.py mlx \
-#       --model-path "$(ls -d ~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/* | head -n1)" \
-#       -b 32 -n 2048 -k 8 -s 50 --warmup 10
-#
-#   # HF on CUDA:
-#   python bench_verify.py hf \
-#       --model-id "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95" \
-#       -b 32 -n 2048 -k 8 -s 50 --warmup 10 --dtype auto --flash
-#
-#   # vLLM on CUDA (prefix-caching enabled):
-#   python bench_verify.py vllm \
-#       --model-id "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95" \
-#       -b 32 -n 2048 -k 8 -s 50 --warmup 10 --dtype auto --gpu-mem 0.95 --enable-prefix-caching
-#
-#   # Run all three:
-#   python bench_verify.py all \
-#       --mlx-model-path "$(ls -d ~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/* | head -n1)" \
-#       --hf-model-id "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95" \
-#       --vllm-model-id "/root/.cache/huggingface/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95" \
-#       -b 32 -n 2048 -k 8 -s 50 --warmup 10 --dtype auto --flash --gpu-mem 0.95 --enable-prefix-caching
-
 import argparse
 import math
 import time
@@ -67,6 +34,8 @@ def run_mlx(model_path, b, n, k, steps, warmup, prompt):
     from mlx_lm.tokenizer_utils import load_tokenizer
     from mlx_lm.models.cache import make_prompt_cache
 
+    from pathlib import Path
+    model_path = Path(model_path)
     print(f"\n[MLX] model: {model_path}")
     model, _cfg = load_model(model_path)
     tok = load_tokenizer(model_path)
@@ -119,8 +88,7 @@ def run_hf(model_id, b, n, k, steps, warmup, prompt, dtype_arg="auto", flash=Fal
     torch.backends.cuda.matmul.allow_tf32 = True
 
     model_kwargs = {"low_cpu_mem_usage": True}
-    if flash:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+    model_kwargs["attn_implementation"] = "flash_attention_2"
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -132,9 +100,8 @@ def run_hf(model_id, b, n, k, steps, warmup, prompt, dtype_arg="auto", flash=Fal
 
     attn_impl = getattr(model.config, "_attn_implementation", None)
     print("attn_impl =", attn_impl)  # should be 'flash_attention_2'
-    from transformers.models.llama.modeling_llama import LlamaFlashAttention2
-    print(isinstance(model.model.layers[0].self_attn, LlamaFlashAttention2))
-
+    # from transformers.models.llama.modeling_llama import LlamaFlashAttention2
+    # print(isinstance(model.model.layers[0].self_attn, LlamaFlashAttention2))
 
     prefix, verify = _build_prefix_and_verify_ids(tok, b, n, k, prompt)
     prefix_t = torch.tensor(prefix, dtype=torch.long, device=device)  # (B,N)
@@ -273,7 +240,7 @@ def main():
 
     # HF
     hf = sub.add_parser("hf", help="Run HF/Transformers (CUDA) benchmark")
-    hf.add_argument("--model-id", type=str, required=True)
+    hf.add_argument("--model-id", type=str, default='meta-llama/Llama-3.2-3B-Instruct')
     hf.add_argument("-b", "--batch", type=int, default=8)
     hf.add_argument("-n", "--n-prefix", type=int, default=2048)
     hf.add_argument("-k", "--k-verify", type=int, default=8)
@@ -327,7 +294,6 @@ def main():
     allp.add_argument("--warmup", type=int, default=10)
     allp.add_argument("--prompt", type=str, default="Why is the sky blue? ")
     allp.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp16", "bf16"])
-    allp.add_argument("--flash", action="store_true")
     allp.add_argument("--device", type=str, default="cuda")
     allp.add_argument("--gpu-mem", type=float, default=0.95)
     allp.add_argument("--enable-prefix-caching", action="store_true")
@@ -343,7 +309,7 @@ def main():
 
     elif args.mode == "hf":
         run_hf(args.model_id, args.batch, args.n_prefix, args.k_verify, args.steps, args.warmup,
-               args.prompt, args.dtype, args.flash, args.device)
+               args.prompt, args.dtype, True, args.device)
 
     elif args.mode == "vllm":
         run_vllm(args.model_id, args.batch, args.n_prefix, args.k_verify, args.steps, args.warmup,
@@ -353,7 +319,7 @@ def main():
     elif args.mode == "both":
         r1 = run_mlx(args.mlx_model_path, args.batch, args.n_prefix, args.k_verify, args.steps, args.warmup, args.prompt)
         r2 = run_hf(args.hf_model_id, args.batch, args.n_prefix, args.k_verify, args.steps, args.warmup,
-                    args.prompt, args.dtype, args.flash, args.device)
+                    args.prompt, args.dtype, True, args.device)
         print("\n==== Summary (avg per step) ====")
         print(f"MLX : {r1['avg_step_s']*1000:.2f} ms | {r1['tok_per_sec']:.1f} tok/s")
         print(f"HF  : {r2['avg_step_s']*1000:.2f} ms | {r2['tok_per_sec']:.1f} tok/s")
