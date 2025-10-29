@@ -1,7 +1,7 @@
 # hf_speculative_server.py
 # Hugging Face Transformers-based speculative decoding verifier (batched).
 # - Single forward per K-group across streams using left-padded KV caches.
-# - Commits by slicing returned past_key_values (no extra forward).
+# - Commits by slicing returned KV and storing as DynamicCache (no extra forward).
 # - Matches MLX logits-based acceptance math.
 #
 # Requirements:
@@ -15,17 +15,16 @@
 #   HF_TOP_K=20
 #   HF_ATTN_IMPL=flash_attention_2   # if installed
 #   HF_TOKEN=hf_xxx                  # if the model is gated
-#
-# This file preserves the same public API defined in `shared.py`.
 
 import asyncio
 import os
 import time
 import random
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache  # <-- important
 
 from shared import (
     MessageChannel,
@@ -74,66 +73,93 @@ PY_RNG = random.Random(SEED)
 
 # ------------------------- Helpers -------------------------
 
-def _past_seq_len(past: Optional[Tuple]) -> int:
-    """Return current sequence length from a HF past_key_values tuple."""
+def _to_legacy(past):
+    """Return legacy tuple[(k,v),...] from either Cache or legacy tuple."""
+    if past is None:
+        return None
+    if hasattr(past, "to_legacy_cache"):
+        return past.to_legacy_cache()
+    return past  # already legacy
+
+
+def _from_legacy(legacy):
+    """Return DynamicCache from legacy tuple."""
+    if legacy is None:
+        return None
+    return DynamicCache.from_legacy_cache(legacy)
+
+
+def _past_seq_len(past) -> int:
+    """Support both Cache (preferred) and legacy."""
     if past is None:
         return 0
-    # past[0] -> (k, v), k shape: (B, H, S, D)
+    if hasattr(past, "get_seq_length"):
+        return int(past.get_seq_length())
+    # legacy tuple
     return int(past[0][0].shape[-2])
 
 
-def _attention_mask_single(past: Optional[Tuple], add_len: int) -> torch.Tensor:
+def _attention_mask_single(past, add_len: int) -> torch.Tensor:
     """Build single-stream full-ones attention mask of shape (1, past_len + add_len)."""
     total = _past_seq_len(past) + add_len
     return torch.ones((1, total), dtype=torch.long, device=DEVICE)
 
 
-def _stack_left_padded_past(pasts: List[Optional[Tuple]]) -> Tuple[Tuple[Tuple[torch.Tensor, torch.Tensor], ...], List[int], int]:
+def _stack_left_padded_past(pasts: List[Optional[DynamicCache]]):
     """
-    Left-pad and stack a list of per-stream past_key_values into a batched past.
+    Left-pad and stack a list of per-stream past_key_values into a batched DynamicCache.
+    Inputs are Cache (preferred) or None.
     Returns:
-      batch_past: tuple over layers, each (K_batch, V_batch) with shape (B, H, max_p, D)
-      lens:       list of original past lengths per stream
-      max_p:      maximum past length across streams
+      batch_past (DynamicCache),
+      lens: list[int], original past lengths per stream,
+      max_p: int, maximum past length across streams
     """
-    assert any(p is not None for p in pasts), "all streams have empty past; prefill required"
-    # Use first non-None past to infer num_layers/H/D
-    ref = next(p for p in pasts if p is not None)
-    num_layers = len(ref)
+    if not any(p is not None for p in pasts):
+        raise RuntimeError("all streams have empty past; prefill required")
+
+    # Use first non-None to infer dims (via legacy tensors)
+    ref_cache = next(p for p in pasts if p is not None)
+    ref_legacy = ref_cache.to_legacy_cache()
+    num_layers = len(ref_legacy)
     B = len(pasts)
 
+    # Compute lengths
     lens = [_past_seq_len(p) for p in pasts]
     max_p = max(lens)
 
     batch_layers = []
     for layer in range(num_layers):
         k_rows, v_rows = [], []
+        # reference shapes
+        k_ref, v_ref = ref_legacy[layer]
+        H, D = k_ref.shape[1], k_ref.shape[-1]
+
         for p in pasts:
             if p is None:
-                # Allocate zeros with (1, H, max_p, D) using ref dims
-                k_ref, v_ref = ref[layer]
-                H, D = k_ref.shape[1], k_ref.shape[-1]
+                # zeros (1,H,max_p,D)
                 k_pad = torch.zeros((1, H, max_p, D), dtype=k_ref.dtype, device=k_ref.device)
                 v_pad = torch.zeros_like(k_pad)
             else:
-                k_i, v_i = p[layer]  # (1, H, L, D)
+                k_i, v_i = p.to_legacy_cache()[layer]  # (1,H,L,D)
                 L = k_i.shape[-2]
                 if L == max_p:
                     k_pad, v_pad = k_i, v_i
                 else:
-                    H, D = k_i.shape[1], k_i.shape[-1]
                     k_pad = torch.zeros((1, H, max_p, D), dtype=k_i.dtype, device=k_i.device)
                     v_pad = torch.zeros_like(k_pad)
-                    # Left-pad: place existing sequence at the right end
+                    # Left-pad: place existing tokens at the right end
                     k_pad[:, :, max_p - L:, :] = k_i
                     v_pad[:, :, max_p - L:, :] = v_i
             k_rows.append(k_pad)
             v_rows.append(v_pad)
+
         K_batch = torch.cat(k_rows, dim=0)  # (B, H, max_p, D)
-        V_batch = torch.cat(v_rows, dim=0)  # (B, H, max_p, D)
+        V_batch = torch.cat(v_rows, dim=0)
         batch_layers.append((K_batch, V_batch))
 
-    return tuple(batch_layers), lens, max_p
+    # Wrap in DynamicCache
+    batch_past = DynamicCache.from_legacy_cache(tuple(batch_layers))
+    return batch_past, lens, max_p
 
 
 def _build_batched_attention(lens: List[int], max_p: int, new_len: int) -> torch.Tensor:
@@ -180,7 +206,7 @@ class StreamState:
     __slots__ = ("past", "last", "eos")
 
     def __init__(self, eos: Optional[int]):
-        self.past = None              # past_key_values for this stream
+        self.past: Optional[DynamicCache] = None
         self.last: Optional[int] = None
         self.eos: Optional[int] = eos
 
@@ -230,11 +256,11 @@ class BatchVerifier:
 
         prefix = torch.tensor(prompt[:-1], dtype=torch.long, device=DEVICE).unsqueeze(0)  # (1, L-1)
         outputs = self.model(prefix, use_cache=True)  # fill KV with prefix only
-        st.past = outputs.past_key_values
+        # Keep HF's native DynamicCache
+        st.past = outputs.past_key_values if isinstance(outputs.past_key_values, DynamicCache) else _from_legacy(_to_legacy(outputs.past_key_values))
         st.last = int(prompt[-1])
 
     async def prefill_batch(self, items: List[Tuple[str, List[int]]]) -> None:
-        # Sequential is fine here; prefill is done once per stream.
         for sid, prompt in items:
             await self.prefill_single(prompt, sid=sid)
 
@@ -258,16 +284,12 @@ class BatchVerifier:
         t0_total = time.perf_counter()
         total_forward = 0.0
         total_positions = 0
-
         results: List[VerifyResponseItem] = []
 
-        # Group by K so we can batch each group tightly
         groups = _group_by_k(batch)
 
         for spec_k, items in groups.items():
-            # Sanity
             if spec_k <= 0:
-                # No drafted tokens → nothing to verify; skip
                 for sid, _, _ in items:
                     results.append(VerifyResponseItem(stream_id=sid, accepted_len=0, base_token=None, hit_eos=False))
                 continue
@@ -280,14 +302,14 @@ class BatchVerifier:
             B = len(items)
             new_len = spec_k + 1  # [last] + K drafted tokens
 
-            # Build inputs: (B, K+1)
+            # (B, K+1) input
             last_col = torch.tensor([st.last for st in states], device=DEVICE, dtype=torch.long).unsqueeze(1)  # (B,1)
             drafts = torch.stack([torch.tensor(d, device=DEVICE, dtype=torch.long) for _, d, _ in items], dim=0)  # (B,K)
             toks_verify = torch.cat([last_col, drafts], dim=1)  # (B, K+1)
 
-            # Build batched past (left-padded to max length) and attention mask
+            # Batched past and attn
             pasts = [st.past for st in states]
-            batch_past, lens, max_p = _stack_left_padded_past(pasts)
+            batch_past, lens, max_p = _stack_left_padded_past(pasts)  # DynamicCache
             attn = _build_batched_attention(lens, max_p, new_len)
 
             # Forward (batched)
@@ -295,7 +317,7 @@ class BatchVerifier:
             outputs = self.model(
                 toks_verify,
                 use_cache=True,
-                past_key_values=batch_past,
+                past_key_values=batch_past,  # DynamicCache
                 attention_mask=attn,
             )
             tfw1 = time.perf_counter()
@@ -310,7 +332,7 @@ class BatchVerifier:
             # Sample base tokens from top-k per row (GPU)
             base_toks = _sample_from_topk(base_val, base_idx, self._gen)  # (B, K+1)
 
-            # Move small things to CPU for acceptance math (to avoid GPU syncs in the loop)
+            # Move small things to CPU for acceptance math
             base_idx_cpu = base_idx.to("cpu")
             base_val_cpu = base_val.to("cpu")
             base_toks_cpu = base_toks.to("cpu")
@@ -327,11 +349,9 @@ class BatchVerifier:
                 hit_eos = False
 
                 if d_idx_rows and d_val_rows:
-                    # Convert once to CPU tensors
-                    d_idx = torch.tensor(d_idx_rows, dtype=torch.long)        # (K, top_k) on CPU
-                    d_val = torch.tensor(d_val_rows, dtype=torch.float32)     # (K, top_k) on CPU
+                    d_idx = torch.tensor(d_idx_rows, dtype=torch.long)        # (K, top_k) CPU
+                    d_val = torch.tensor(d_val_rows, dtype=torch.float32)     # (K, top_k) CPU
                     for t, tok in enumerate(draft_toks):
-                        # Draft row: locate tok in draft top-k
                         row_ids = d_idx[t]
                         row_vals = d_val[t]
                         where = (row_ids == int(tok)).nonzero(as_tuple=False)
@@ -339,8 +359,7 @@ class BatchVerifier:
                             break
                         draft_logit = float(row_vals[where[0, 0]])
 
-                        # Base row: does base include tok in its top-k?
-                        b_ids = base_idx_cpu[i, t]  # (top_k,)
+                        b_ids = base_idx_cpu[i, t]  # (k,)
                         b_vals = base_val_cpu[i, t]
                         pos = (b_ids == int(tok)).nonzero(as_tuple=False)
                         if pos.numel() == 0:
@@ -351,9 +370,7 @@ class BatchVerifier:
                         if draft_logit <= base_logit:
                             accepted += 1
                         else:
-                            # deterministic Python RNG
-                            u = self._py_rng.random()
-                            if u <= (base_logit / draft_logit):
+                            if self._py_rng.random() <= (base_logit / draft_logit):
                                 accepted += 1
                             else:
                                 break
@@ -361,7 +378,7 @@ class BatchVerifier:
                         if (st.eos is not None) and (int(tok) == st.eos):
                             hit_eos = True
                             break
-                # else: If no draft top-k rows, accept none
+                # else: no draft top-k rows → accept none
 
                 # Base fallback (position m) if EOS not hit
                 base_token: Optional[int] = None
@@ -375,27 +392,27 @@ class BatchVerifier:
                 base_appended_list.append(base_appended)
                 hit_eos_list.append(hit_eos)
 
-            # Commit by slicing returned KV for each stream (drop left pad; keep only committed portion)
-            new_kv = outputs.past_key_values  # tuple over layers; each (K,V) is (B, H, max_p + new_len, D)
+            # Commit by slicing returned KV (drop left pad; keep only committed portion)
+            # Convert outputs cache to legacy tensors for slicing
+            new_kv_legacy = _to_legacy(outputs.past_key_values)  # tuple[(K,V),...], shapes (B,H,max_p+new_len,D)
+            committed_per_stream: List[DynamicCache] = []
+
             for i, st in enumerate(states):
-                keep_extra = accepted_list[i] + base_appended_list[i]  # number of tokens to add beyond existing past
+                keep_extra = accepted_list[i] + base_appended_list[i]
                 if keep_extra > 0:
                     pad_left = max_p - lens[i]
                     end = max_p + keep_extra  # slice [pad_left : end)
                     committed_layers = []
-                    for (k_b, v_b) in new_kv:
-                        # k_b/v_b: (B, H, max_p + new_len, D)
-                        k_i = k_b[i:i+1, :, pad_left:end, :].contiguous()  # (1, H, L_i + keep_extra, D)
+                    for (k_b, v_b) in new_kv_legacy:
+                        k_i = k_b[i:i+1, :, pad_left:end, :].contiguous()  # (1,H,L_i+keep,D)
                         v_i = v_b[i:i+1, :, pad_left:end, :].contiguous()
                         committed_layers.append((k_i, v_i))
-                    st.past = tuple(committed_layers)
-
+                    st.past = _from_legacy(tuple(committed_layers))
                 # Advance "last"
                 if base_appended_list[i] == 1:
                     st.last = base_token_list[i]
                 elif accepted_list[i] > 0:
                     st.last = int(items[i][1][accepted_list[i] - 1])
-                # else: _last unchanged (rare)
 
             # Collect responses
             for i, (sid, _, _) in enumerate(items):
@@ -410,7 +427,6 @@ class BatchVerifier:
         t1_total = time.perf_counter()
         e2e_time = t1_total - t0_total
 
-        # Update running totals
         self.verify_iterations += 1
         self.total_forward_time += total_forward
         self.total_e2e_time += e2e_time
@@ -442,7 +458,7 @@ class HFVerifierSession:
         self.tok = tok
         self.eos: Optional[int] = getattr(tok, "eos_token_id", None)
 
-        self._past = None
+        self._past: Optional[DynamicCache] = None
         self._last: Optional[int] = None
 
         self._gen = GENERATOR["cuda" if DEVICE.type == "cuda" else "cpu"]
@@ -468,7 +484,7 @@ class HFVerifierSession:
             raise ValueError("empty prompt")
         prefix = torch.tensor(prompt[:-1], dtype=torch.long, device=DEVICE).unsqueeze(0)  # (1, L-1)
         outputs = self.model(prefix, use_cache=True)  # fill KV with prefix only
-        self._past = outputs.past_key_values
+        self._past = outputs.past_key_values if isinstance(outputs.past_key_values, DynamicCache) else _from_legacy(_to_legacy(outputs.past_key_values))
         self._last = int(prompt[-1])
 
     @torch.inference_mode()
@@ -490,7 +506,7 @@ class HFVerifierSession:
         outputs = self.model(
             toks_verify,
             use_cache=True,
-            past_key_values=self._past,
+            past_key_values=self._past,   # DynamicCache
             attention_mask=attn,
         )
         tfw1 = time.perf_counter()
@@ -533,7 +549,7 @@ class HFVerifierSession:
                 if draft_logit <= base_logit:
                     accepted += 1
                 else:
-                    if self._py_rng.random() <= (base_logit / draft_logit):
+                    if PY_RNG.random() <= (base_logit / draft_logit):
                         accepted += 1
                     else:
                         break
@@ -549,18 +565,20 @@ class HFVerifierSession:
             base_token = int(base_toks_cpu[accepted].item())
             base_appended = 1
 
-        # Commit by slicing returned KV (exclude uncommitted verify steps)
+        # Commit by slicing returned KV
         keep_extra = accepted + base_appended
         if keep_extra > 0:
             past_len = _past_seq_len(self._past)
-            end = past_len + keep_extra
+            # Convert outputs cache to legacy to slice easily
+            out_legacy = _to_legacy(outputs.past_key_values)  # ( (k,v), ... )
             committed_layers = []
-            for (k_b, v_b) in outputs.past_key_values:
-                # k_b/v_b: (1, H, past_len + K+1, D)
+            for (k_b, v_b) in out_legacy:
+                # k_b/v_b: (1, H, past_len + K+1, D). Keep upto past_len + keep_extra
+                end = past_len + keep_extra
                 k_i = k_b[:, :, :end, :].contiguous()
                 v_i = v_b[:, :, :end, :].contiguous()
                 committed_layers.append((k_i, v_i))
-            self._past = tuple(committed_layers)
+            self._past = _from_legacy(tuple(committed_layers))
 
         # Advance last
         if base_appended == 1:
@@ -629,8 +647,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     finally:
         # Print timing summary
         if verifier.verify_iterations > 0:
-            avg_fwd = verifier.total_forward_time / verifier.verify_iterations
-            avg_e2e = verifier.total_e2e_time / verifier.verify_iterations
+            avg_fwd = verifier.total_forward_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
+            avg_e2e = verifier.total_e2e_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
             avg_tps_fwd = verifier.total_tokens_processed / verifier.total_forward_time if verifier.total_forward_time > 0 else 0.0
             avg_tps_e2e = verifier.total_tokens_processed / verifier.total_e2e_time if verifier.total_e2e_time > 0 else 0.0
             print(f"\n[BATCH SERVER TIMING SUMMARY]")
@@ -657,7 +675,6 @@ async def main() -> None:
         "low_cpu_mem_usage": True,
         "token": hf_token,
     }
-    # Optional attention implementation (e.g., FlashAttention 2) if requested
     if ATTN_IMPL_ENV:
         from_kwargs["attn_implementation"] = ATTN_IMPL_ENV
 
