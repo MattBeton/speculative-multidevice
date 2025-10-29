@@ -302,6 +302,12 @@ class BatchVerifier:
             B = len(items)
             new_len = spec_k + 1  # [last] + K drafted tokens
 
+            # Timing breakdown start
+            t0 = time.perf_counter()
+            torch.cuda.synchronize()
+
+            # Stack phase
+            t_stack0 = time.perf_counter()
             # (B, K+1) input
             last_col = torch.tensor([st.last for st in states], device=DEVICE, dtype=torch.long).unsqueeze(1)  # (B,1)
             drafts = torch.stack([torch.tensor(d, device=DEVICE, dtype=torch.long) for _, d, _ in items], dim=0)  # (B,K)
@@ -311,20 +317,25 @@ class BatchVerifier:
             pasts = [st.past for st in states]
             batch_past, lens, max_p = _stack_left_padded_past(pasts)  # DynamicCache
             attn = _build_batched_attention(lens, max_p, new_len)
+            torch.cuda.synchronize()
+            t_stack1 = time.perf_counter()
 
-            # Forward (batched)
-            tfw0 = time.perf_counter()
+            # Forward phase
+            t_fwd0 = time.perf_counter()
             outputs = self.model(
                 toks_verify,
                 use_cache=True,
                 past_key_values=batch_past,  # DynamicCache
                 attention_mask=attn,
             )
-            tfw1 = time.perf_counter()
-            forward_time = tfw1 - tfw0
+            torch.cuda.synchronize()
+            t_fwd1 = time.perf_counter()
+            forward_time = t_fwd1 - t_fwd0
             total_forward += forward_time
             total_positions += B * new_len
 
+            # Post-processing phase (top-k, sampling, acceptance)
+            t_post0 = time.perf_counter()
             logits = outputs.logits  # (B, K+1, V)
 
             # Base top-k on GPU
@@ -391,7 +402,11 @@ class BatchVerifier:
                 base_token_list.append(base_token)
                 base_appended_list.append(base_appended)
                 hit_eos_list.append(hit_eos)
+            torch.cuda.synchronize()
+            t_post1 = time.perf_counter()
 
+            # Commit phase
+            t_commit0 = time.perf_counter()
             # Commit by slicing returned KV (drop left pad; keep only committed portion)
             # Convert outputs cache to legacy tensors for slicing
             new_kv_legacy = _to_legacy(outputs.past_key_values)  # tuple[(K,V),...], shapes (B,H,max_p+new_len,D)
@@ -413,6 +428,13 @@ class BatchVerifier:
                     st.last = base_token_list[i]
                 elif accepted_list[i] > 0:
                     st.last = int(items[i][1][accepted_list[i] - 1])
+            torch.cuda.synchronize()
+            t_commit1 = time.perf_counter()
+
+            # Print breakdown for this group
+            print(f"[breakdown] stack={t_stack1-t_stack0:.4f}s fwd={t_fwd1-t_fwd0:.4f}s "
+                  f"post={t_post1-t_post0:.4f}s commit={t_commit1-t_commit0:.4f}s "
+                  f"total={time.perf_counter()-t0:.4f}s")
 
             # Collect responses
             for i, (sid, _, _) in enumerate(items):
