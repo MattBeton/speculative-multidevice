@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.cache_utils import DynamicCache  # <-- important
+from transformers.cache_utils import DynamicCache
 
 from shared import (
     MessageChannel,
@@ -419,8 +419,8 @@ class BatchVerifier:
                     end = max_p + keep_extra  # slice [pad_left : end)
                     committed_layers = []
                     for (k_b, v_b) in new_kv_legacy:
-                        k_i = k_b[i:i+1, :, pad_left:end, :].contiguous()  # (1,H,L_i+keep,D)
-                        v_i = v_b[i:i+1, :, pad_left:end, :].contiguous()
+                        k_i = k_b[i:i+1, :, pad_left:end, :]  # (1,H,L_i+keep,D)
+                        v_i = v_b[i:i+1, :, pad_left:end, :]
                         committed_layers.append((k_i, v_i))
                     st.past = _from_legacy(tuple(committed_layers))
                 # Advance "last"

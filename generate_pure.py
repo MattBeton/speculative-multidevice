@@ -5,9 +5,8 @@ import numpy as np
 from model import MLXGenerationModel
 from timing import TokenTimer
 
-# MODEL = "/Users/frank/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-8bit/snapshots/0e42af58449718de7931ee04f28191fbe6c43a56"
 MODEL_PATH = next(Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/").glob("*"))
-# MODEL_PATH = next(Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*"))
+
 PROMPT = "Write a terse haiku about Apple MLX."
 MAX_NEW_TOKENS = 64
 RUNS = 3

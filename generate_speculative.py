@@ -1,39 +1,17 @@
 # pip install mlx-lm
 from pathlib import Path
-from typing import Dict, List
-from tqdm import tqdm
-
 import numpy as np
 
 from model import MLXGenerationModel
 from timing import TokenTimer
 
-DRAFT_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
-DRAFT_MODEL_PATH = next(DRAFT_MODEL_PATH)
-# BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*")
-BASE_MODEL_PATH = Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/").glob("*")
-BASE_MODEL_PATH = next(BASE_MODEL_PATH)
+DRAFT_MODEL_PATH = next(Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/").glob("*"))
+BASE_MODEL_PATH = next(Path("/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/").glob("*"))
 
-# PROMPT = "Write a terse haiku about Apple MLX."
 PROMPT = "Why is the sky blue?"
-
 MAX_NEW_TOKENS = 64
 SPEC_K_VALUES = [4, 8]
 RUNS = 10
-
-
-def _summarize_phase(results: List[Dict], key: str) -> Dict[str, float]:
-    runs = len(results)
-    tokens_total = sum(r[key].tokens for r in results if r[key] is not None)
-    seconds_total = sum(r[key].seconds for r in results if r[key] is not None)
-    tokens_avg = tokens_total / runs if runs else 0
-    seconds_avg = seconds_total / runs if runs else 0
-    tok_per_sec = (tokens_total / seconds_total) if seconds_total else float("inf")
-    return {
-        "tokens_avg": tokens_avg,
-        "seconds_avg": seconds_avg,
-        "tok_per_sec": tok_per_sec,
-    }
 
 
 def _speculative_single_run(
@@ -161,13 +139,28 @@ def _speculative_single_run(
                 break
 
     generated_ids = ids[prompt_length:]
+    generated_list = generated_ids.tolist()
     return {
         "prefill": timer.get("prefill"),
         "decode": timer.get("decode"),
         "drafted": total_drafted,
         "accepted": total_accepted,
-        "generated_ids": generated_ids.tolist(),
-        "text": base_model.decode(generated_ids),
+        "generated": generated_list,
+        "text": base_model.decode(generated_list),
+    }
+
+
+def _summarize_phase(results, key: str):
+    runs = len(results)
+    tokens_total = sum(r[key].tokens for r in results if r[key] is not None)
+    seconds_total = sum(r[key].seconds for r in results if r[key] is not None)
+    tokens_avg = tokens_total / runs if runs else 0
+    seconds_avg = seconds_total / runs if runs else 0
+    tok_per_sec = (tokens_total / seconds_total) if seconds_total else float("inf")
+    return {
+        "tokens_avg": tokens_avg,
+        "seconds_avg": seconds_avg,
+        "tok_per_sec": tok_per_sec,
     }
 
 
@@ -175,8 +168,8 @@ def run_speculative(spec_k: int, runs: int = RUNS):
     draft_model = MLXGenerationModel(DRAFT_MODEL_PATH)
     base_model = MLXGenerationModel(BASE_MODEL_PATH)
 
-    results: List[Dict] = []
-    for _ in tqdm(range(runs)):
+    results = []
+    for _ in range(runs):
         results.append(_speculative_single_run(draft_model, base_model, spec_k))
 
     prefill_summary = _summarize_phase(results, "prefill")
@@ -201,7 +194,7 @@ def run_speculative(spec_k: int, runs: int = RUNS):
     }
 
 
-def _print_phase_summary(name: str, summary: Dict[str, float]) -> None:
+def _print_phase_summary(name: str, summary: dict):
     print(
         f"[{name:7}] avg {summary['tokens_avg']:.1f} toks in {summary['seconds_avg']:.3f}s  → {summary['tok_per_sec']:.1f} tok/s"
     )
