@@ -400,7 +400,7 @@ def main():
         print(f"  P99:    {results['p99_latency_ms']:.2f}")
 
         print(f"\nThroughput: {results['tokens_per_second']:.2f} tokens/second")
-        print(f"Time per token: {results['time_per_token_ms']:.3f} ms")
+        print(f"Time per token:{results['time_per_token_ms']:.3f} ms")
 
     # Memory usage
     if torch.cuda.is_available():
