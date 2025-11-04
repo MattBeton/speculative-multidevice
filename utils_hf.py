@@ -12,6 +12,36 @@ def get_pad_id(tokenizer):
         tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
     )
 
+def make_leftpad_causal_4d_mask(lengths: list[int]):
+    """
+    Returns a (B, 1, S, S) additive mask in float32.
+    0.0 = allowed, large negative = masked.
+    For left padding we also allow pad rows to attend to themselves (diagonal),
+    preventing all-masked rows -> NaNs on MPS fp16.
+    """
+    B = len(lengths)
+    S = max(lengths)
+    device = DEVICE  # Use the global DEVICE constant
+    NEG = -1e9  # avoid -inf on MPS
+
+    mask = torch.full((B, 1, S, S), NEG, dtype=torch.float32, device=device)
+    ar = torch.arange(S, device=device)
+
+    for b, L in enumerate(lengths):
+        start = S - L  # first real token index in left-padded sequence
+        if L > 0:
+            q = ar[start:]
+            k = ar[start:]
+            # causal inside the valid (L x L) block
+            causal = (k[None, :] <= q[:, None])
+            mask[b, 0, q[:, None], k[None, :]] = torch.where(causal, torch.tensor(0.0, device=device),
+                                                             torch.tensor(NEG, device=device))
+        if start > 0:
+            # allow pad rows to attend to themselves only
+            p = ar[:start]
+            mask[b, 0, p, p] = 0.0
+    return mask
+
 def print_cache(cache: DynamicCache, idx: int, layer: Optional[int]=0):
     print(cache.layers[layer].keys[idx, 0, :, 0])
 
@@ -66,18 +96,26 @@ def prefill(model: nn.Module, tokens: list[list[int]], tokenizer=None):
     x = torch.tensor(padded, dtype=torch.long, device=DEVICE)
 
     cache = DynamicCache(
-        config=model.config, 
+        config=model.config,
     )
 
-    attention_mask, position_ids = mask_and_pos_ids([len(x) for x in tokens])
-    # print(attention_mask, position_ids)
+    ## MASKING
+    lengths = [len(t) for t in tokens]
 
+    attn2d = torch.zeros((len(tokens), max_len), dtype=torch.bool, device=DEVICE)
+    for i, L in enumerate(lengths):
+        attn2d[i, max_len - L:] = True
+    position_ids = (attn2d.long().cumsum(dim=-1) - 1).clamp_min(0).to(torch.long)
+
+    attn4d = make_leftpad_causal_4d_mask(lengths)
+
+    ## GENERATE
     outputs = model(
-        input_ids=x, 
-        attention_mask=attention_mask,
-        past_key_values=cache, 
+        input_ids=x,
+        attention_mask=attn4d,      # <— 4D additive mask (float32)
+        position_ids=position_ids,  # <— 2D positions derived from left padding
+        past_key_values=cache,
         use_cache=True,
-        position_ids=position_ids,
     )
 
     return outputs.past_key_values
