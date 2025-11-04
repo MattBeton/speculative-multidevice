@@ -39,7 +39,7 @@ esac
 
 # Copy current directory contents to remote
 echo "Copying files to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}..."
-sshpass -p "${PASSWORD}" rsync -av --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' -e ssh ./ ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/
+sshpass -p "${PASSWORD}" rsync -av --exclude='.git' --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' -e ssh ./ ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/
 
 if [ $? -eq 0 ]; then
   echo "Successfully copied files to remote server"

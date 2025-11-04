@@ -199,3 +199,38 @@ def generate_step(
     next_tok = out.logits[:, -1].argmax(dim=-1).tolist()
     lengths = lengths + 1
     return [[t] for t in next_tok], lengths
+
+def zero_cache(cache: DynamicCache, lengths: list[int]):
+    assert cache.layers[0].keys is not None and cache.layers[0].values is not None
+    B = cache.layers[0].keys.shape[0]
+
+    # Prepare destination cache
+    dst = DynamicCache()
+
+    for layer in range(len(cache)):
+        K = cache.layers[layer].keys
+        V = cache.layers[layer].values
+        assert K is not None and V is not None
+
+        _, H, S, D = K.shape
+
+        K_new = K.new_zeros((B, H, S, D))
+        V_new = V.new_zeros((B, H, S, D))
+
+        # Copy per row
+        for i in range(B):
+            length = lengths[i]
+            if length == 0:
+                continue
+            # surviving tokens are the first 'keep' positions (earliest..latest-rollback)
+            K_src = K[i, :, S-length:, :]
+            V_src = V[i, :, S-length:, :]
+
+            # right-aligned → write to the right, pad on the left implicitly
+            K_new[i, :, S-length:, :] = K_src
+            V_new[i, :, S-length:, :] = V_src
+
+        # print(dst.layers[layer].keys[i, 0, :, 0])
+        dst.update(K_new, V_new, layer)
+
+    return dst
