@@ -93,6 +93,11 @@ class BatchVerifier:
         draft_topk_vals: list[list[list[float]]],
         draft_topk_idx: list[list[list[int]]],
     ) -> VerifyResponse:
+        print(draft_toks)
+        draft_toks = [
+            x if len(x) != 0 else [PAD_ID] * 9
+            for x in draft_toks 
+        ]
         assert all([len(x) == len(draft_toks[0]) for x in draft_toks])
         x = torch.tensor(draft_toks, dtype=torch.long, device=DEVICE)
 

@@ -118,10 +118,18 @@ class BatchDraftClient:
             return sum(len(st.generated) for st in self._streams)
 
         with timer.measure("decode", _total_committed):
+            round_count = 0
+            max_rounds = 5
             while True:
                 # Check if all streams are finished
                 if all(st.finished for st in self._streams):
                     break
+                
+                # Limit to 5 rounds of drafting
+                if round_count >= max_rounds:
+                    break
+                
+                round_count += 1
 
                 # Prepare batch verify request
                 draft_toks_batch: List[List[int]] = []
@@ -227,8 +235,8 @@ class BatchDraftClient:
 
 async def main() -> None:
     # Connect to server
-    # ip = '192.168.200.2'
-    ip = 'localhost'
+    ip = '192.168.200.2'
+    # ip = 'localhost'
     reader, writer = await asyncio.open_connection(ip, 7070)
     channel = MessageChannel(reader, writer)
     client = BatchDraftClient(channel, PROMPTS)
