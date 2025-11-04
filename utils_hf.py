@@ -14,7 +14,7 @@ def get_pad_id(tokenizer):
 
 def make_leftpad_causal_4d_mask(lengths: list[int]):
     """
-    Returns a (B, 1, S, S) additive mask in float32.
+    Returns a (B, 1, S, S) additive mask in the model's dtype.
     0.0 = allowed, large negative = masked.
     For left padding we also allow pad rows to attend to themselves (diagonal),
     preventing all-masked rows -> NaNs on MPS fp16.
@@ -24,7 +24,7 @@ def make_leftpad_causal_4d_mask(lengths: list[int]):
     device = DEVICE  # Use the global DEVICE constant
     NEG = -1e9  # avoid -inf on MPS
 
-    mask = torch.full((B, 1, S, S), NEG, dtype=torch.float32, device=device)
+    mask = torch.full((B, 1, S, S), NEG, dtype=DTYPE, device=device)
     ar = torch.arange(S, device=device)
 
     for b, L in enumerate(lengths):
@@ -34,8 +34,8 @@ def make_leftpad_causal_4d_mask(lengths: list[int]):
             k = ar[start:]
             # causal inside the valid (L x L) block
             causal = (k[None, :] <= q[:, None])
-            mask[b, 0, q[:, None], k[None, :]] = torch.where(causal, torch.tensor(0.0, device=device),
-                                                             torch.tensor(NEG, device=device))
+            mask[b, 0, q[:, None], k[None, :]] = torch.where(causal, torch.tensor(0.0, dtype=DTYPE, device=device),
+                                                             torch.tensor(NEG, dtype=DTYPE, device=device))
         if start > 0:
             # allow pad rows to attend to themselves only
             p = ar[:start]

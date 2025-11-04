@@ -29,14 +29,9 @@ from shared import (
     MessageChannel,
     PrefillRequest,
     PrefillResponse,
-    PrefillBatchRequest,
-    PrefillBatchResponse,
     ResetRequest,
     VerifyRequest,
     VerifyResponse,
-    VerifyBatchRequest,
-    VerifyBatchResponse,
-    VerifyResponseItem,
 )
 
 from const import (
@@ -102,34 +97,47 @@ class BatchVerifier:
         x = torch.tensor(draft_toks, dtype=torch.long, device=DEVICE)
 
         outputs = self.model(
-            x, 
-            use_cache=True, 
+            x,
+            use_cache=True,
             past_key_values=self.cache
         )
 
         self.tokens = [x + y for x, y in zip(self.tokens, draft_toks)]
 
-        # TODO: Logic to use logits.
+        # Get logits from model output
+        logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
+
+        # TODO: Logic to use logits for acceptance.
+        # For now, using random acceptance for testing
         accept_values = []
         import random
         for _ in range(len(draft_toks)):
-            accept_values.append(random.randint(0, len(draft_toks[0])))
+            accept_values.append(random.randint(1, len(draft_toks[0])))
+
+        # Sample base tokens from the accepted position's logits
+        base_tokens = []
+        for i, accepted in enumerate(accept_values):
+            accepted_logits = logits[i, accepted-1, :]  # (vocab_size,)
+
+            top_k_logits, top_k_indices = torch.topk(accepted_logits, TOP_K)
+            probs = torch.softmax(top_k_logits, dim=-1)
+
+            # Sample from the top-k distribution
+            sampled_idx = torch.multinomial(probs, num_samples=1, generator=GENERATOR["cuda" if DEVICE.type == "cuda" else "cpu"])
+            sampled_token = top_k_indices[sampled_idx].item()
+
+            base_tokens.append(sampled_token)
 
         rollback_values = [len(draft_toks[0]) - y for y in accept_values]
         rollback_dynamic_per_row_simple(self.cache, self.tokens, rollback_values)
 
-        base_tokens = [
-
-        ]
-
         hit_eos = [False for _ in range(len(draft_toks))]
 
         return VerifyResponse(
-            accept_values,
-
+            accepted_len=accept_values,
+            base_token=base_tokens,
+            hit_eos=hit_eos,
         )
-
-        return outputs.past_key_values, accept_values
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, verifier: BatchVerifier) -> None:
@@ -147,14 +155,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await verifier.reset()
 
             elif isinstance(msg, PrefillRequest):
-                await verifier.prefill_batch([(it.stream_id, it.prompt) for it in msg.items])
-                await channel.send(PrefillBatchResponse(ok=True, count=len(msg.items)))
+                await verifier.prefill_batch(msg.prompts)
+                await channel.send(PrefillResponse(ok=True))
 
             elif isinstance(msg, VerifyRequest):
-                res_items = await verifier.verify_batch(
+                res = await verifier.verify_batch(
                     msg.draft_toks, msg.draft_topk_vals, msg.draft_topk_idx,
                 )
-                await channel.send(VerifyBatchResponse(items=res_items))
+                await channel.send(res)
 
             else:
                 raise RuntimeError(f"unhandled message type: {type(msg)!r}")
