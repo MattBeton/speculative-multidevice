@@ -186,6 +186,9 @@ async def run_bench(
         if not isinstance(out, VerifyResponse):
             raise RuntimeError(f"Expected VerifyResponse, got {type(out)!r}")
         latencies.append(dt)
+        
+        # ensure post_verify can complete
+        await asyncio.sleep(0.1)
 
     await channel.close()
 
