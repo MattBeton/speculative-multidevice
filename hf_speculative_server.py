@@ -71,6 +71,8 @@ class BatchVerifier:
         self.total_post_model_time = 0.0
         self.total_e2e_time = 0.0
         self.total_tokens_processed = 0
+        self.total_positions_verified = 0
+        self.total_positions_verified = 0
 
     async def reset(self) -> None:
         if self.post_verify_task is not None and not self.post_verify_task.done():
@@ -84,6 +86,7 @@ class BatchVerifier:
         self.total_post_model_time = 0.0
         self.total_e2e_time = 0.0
         self.total_tokens_processed = 0
+        self.total_positions_verified = 0
 
     async def prefill_batch(self, prompts: list[list[int]]) -> None:
         self.tokens = [p[:-1] for p in prompts]
@@ -243,6 +246,9 @@ class BatchVerifier:
         # Count tokens processed (sum of accepted + base tokens appended)
         tokens_this_batch = sum(accepted) + sum(1 for eos in hit_eos if not eos)
         self.total_tokens_processed += tokens_this_batch
+        # Count positions verified (B * K) to match benchmark metric
+        positions_this_batch = B * K
+        self.total_positions_verified += positions_this_batch
 
         return VerifyResponse(
             accepted_len=[int(x) for x in accepted],
@@ -324,25 +330,29 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     finally:
         # Print timing summary
         if verifier.verify_iterations > 0:
+            total_time = verifier.total_forward_time + verifier.total_post_model_time
             avg_fwd = verifier.total_forward_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
             avg_post = verifier.total_post_model_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
-            avg_tps_fwd = verifier.total_tokens_processed / verifier.total_forward_time if verifier.total_forward_time > 0 else 0.0
-            avg_tps_post = verifier.total_tokens_processed / verifier.total_post_model_time if verifier.total_post_model_time > 0 else 0.0
+            avg_total = total_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
+            combined_tps = verifier.total_positions_verified / total_time if total_time > 0 else 0.0
             print(f"\n[BATCH SERVER TIMING SUMMARY]")
             print(f"  Total verify iterations: {verifier.verify_iterations}")
+            print(f"  Total positions verified: {verifier.total_positions_verified}")
             print(f"  Total tokens processed:  {verifier.total_tokens_processed}")
             print(f"  Total model call time:   {verifier.total_forward_time:.4f}s")
             print(f"  Total post-model time:   {verifier.total_post_model_time:.4f}s")
+            print(f"  Total time:              {total_time:.4f}s")
             print(f"  Avg time/verify (model): {avg_fwd:.4f}s")
             print(f"  Avg time/verify (post):  {avg_post:.4f}s")
-            print(f"  Avg tokens/sec (model):  {avg_tps_fwd:.2f}")
-            print(f"  Avg tokens/sec (post):   {avg_tps_post:.2f}")
+            print(f"  Avg time/verify (total): {avg_total:.4f}s")
+            print(f"  TPS (positions/sec):    {combined_tps:.1f}")
             # Reset timing statistics for the next client connection
             verifier.verify_iterations = 0
             verifier.total_forward_time = 0.0
             verifier.total_post_model_time = 0.0
             verifier.total_e2e_time = 0.0
             verifier.total_tokens_processed = 0
+            verifier.total_positions_verified = 0
         await channel.close()
 
 
