@@ -1,4 +1,5 @@
 # speculative_client.py
+import argparse
 import asyncio
 import time
 from pathlib import Path
@@ -261,11 +262,9 @@ class BatchDraftClient:
         return [stream.decoded_text() for stream in self._streams]
 
 
-async def main() -> None:
+async def main(host: str = 'localhost') -> None:
     # Connect to server
-    ip = '192.168.200.2'
-    # ip = 'localhost'
-    reader, writer = await asyncio.open_connection(ip, 7070)
+    reader, writer = await asyncio.open_connection(host, 7070)
     channel = MessageChannel(reader, writer)
     client = BatchDraftClient(channel, PROMPTS)
 
@@ -315,4 +314,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Speculative decoding client")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="localhost",
+        help="Host address to connect to (default: localhost)"
+    )
+    args = parser.parse_args()
+    asyncio.run(main(host=args.host))

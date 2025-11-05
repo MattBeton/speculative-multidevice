@@ -11,6 +11,7 @@ from shared import (
     PrefillRequest,
     PrefillResponse,
     ResetRequest,
+    ResetResponse,
     VerifyRequest,
     VerifyResponse,
     run_mlx,
@@ -179,6 +180,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
             if isinstance(msg, ResetRequest):
                 await session.reset()
+                await channel.send(ResetResponse(ok=True))
             elif isinstance(msg, PrefillRequest):
                 await session.prefill(msg.prompts)
                 await channel.send(PrefillResponse(ok=True))

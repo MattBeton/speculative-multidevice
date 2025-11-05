@@ -253,6 +253,8 @@ class BatchVerifier:
 
         # Old unified length (what's currently in self.cache)
         old_legacy = self.cache.to_legacy_cache()
+        if len(old_legacy) == 0 or len(old_legacy[0]) == 0:
+            raise RuntimeError("Cannot commit with empty cache - prefill must be called first")
         S_prev = old_legacy[0][0].shape[2]  # (B, H, S_prev, D)
 
         # New unified length target after commit
