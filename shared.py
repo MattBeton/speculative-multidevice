@@ -35,6 +35,10 @@ class ResetRequest(Message):
     """Reset whole session on the server (clears all stream states)."""
     pass
 
+class ResetResponse(Message):
+    """Acknowledgment that reset completed."""
+    ok: bool = True
+
 class PrefillRequest(Message):
     prompts: list[list[int]]
 
@@ -53,13 +57,14 @@ class VerifyResponse(Message):
 
 
 MessageType = Union[
-    ResetRequest,
+    ResetRequest, ResetResponse,
     PrefillRequest, PrefillResponse,
     VerifyRequest, VerifyResponse,
 ]
 
 _TYPE_TO_NAME: Dict[Type[Message], str] = {
     ResetRequest: "reset",
+    ResetResponse: "reset_response",
     PrefillRequest: "prefill",
     PrefillResponse: "prefill_response",
     VerifyRequest: "verify",

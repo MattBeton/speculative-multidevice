@@ -30,6 +30,7 @@ from shared import (
     PrefillRequest,
     PrefillResponse,
     ResetRequest,
+    ResetResponse,
     VerifyRequest,
     VerifyResponse,
 )
@@ -314,6 +315,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
             if isinstance(msg, ResetRequest):
                 await verifier.reset()
+                await channel.send(ResetResponse(ok=True))
 
             elif isinstance(msg, PrefillRequest):
                 await verifier.prefill_batch(msg.prompts)
