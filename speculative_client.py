@@ -1,5 +1,6 @@
 # speculative_client.py
 import asyncio
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -117,6 +118,10 @@ class BatchDraftClient:
         def _total_committed() -> int:
             return sum(len(st.generated) for st in self._streams)
 
+        # Timing accumulators for decode phase
+        total_client_time = 0.0
+        total_server_wait_time = 0.0
+
         with timer.measure("decode", _total_committed):
             round_count = 0
             max_rounds = 5
@@ -136,7 +141,8 @@ class BatchDraftClient:
                 draft_topk_idx_batch: List[List[List[int]]] = []
                 draft_topk_vals_batch: List[List[List[float]]] = []
 
-                # 1) Generate draft tokens for each stream
+                # 1) Generate draft tokens for each stream (client work)
+                client_start = time.perf_counter()
                 for stream in self._streams:
                     # For finished streams, add empty drafts
                     if stream.finished or len(stream.generated) >= max_new_tokens:
@@ -169,23 +175,33 @@ class BatchDraftClient:
                     draft_topk_idx_batch.append(draft_topk_idx)
                     draft_topk_vals_batch.append(draft_topk_vals)
 
+                # Pause client timing before server wait
+                client_time_before_server = time.perf_counter() - client_start
+                total_client_time += client_time_before_server
+
                 # If no active streams, break
                 if all(len(toks) == 0 for toks in draft_toks_batch):
                     break
 
-                # 2) Send batch verify request
+                # 2) Send batch verify request and wait for response (server wait)
                 verify_req = VerifyRequest(
                     draft_toks=draft_toks_batch,
                     draft_topk_vals=draft_topk_vals_batch,
                     draft_topk_idx=draft_topk_idx_batch
                 )
+                server_wait_start = time.perf_counter()
                 await self._channel.send(verify_req)
 
                 resp = await self._channel.recv()
+                server_wait_end = time.perf_counter()
+                server_wait_time = server_wait_end - server_wait_start
+                total_server_wait_time += server_wait_time
+
                 if not isinstance(resp, VerifyResponse):
                     raise RuntimeError(f"expected VerifyResponse, got {type(resp)!r}")
 
-                # 3) Apply results per stream
+                # 3) Apply results per stream (client work)
+                client_start = time.perf_counter()
                 for i, stream in enumerate(self._streams):
                     # Skip finished streams
                     if stream.finished:
@@ -228,6 +244,14 @@ class BatchDraftClient:
                         stream.last_token = base_tok if base_tok is not None else (
                             accepted_tokens[-1] if accepted_tokens else stream.last_token
                         )
+                
+                # Accumulate remaining client time for this round
+                client_end = time.perf_counter()
+                total_client_time += client_end - client_start
+
+        # Store timing values for reporting
+        self._decode_client_time = total_client_time
+        self._decode_server_wait_time = total_server_wait_time
 
         # Decode final texts
         return [stream.decoded_text() for stream in self._streams]
@@ -260,6 +284,14 @@ async def main() -> None:
 
         if decode:
             _print_phase_summary("decode", decode.tokens, decode.seconds)
+            # Print client vs server timing breakdown
+            if hasattr(client, '_decode_client_time') and hasattr(client, '_decode_server_wait_time'):
+                client_time = client._decode_client_time
+                server_wait_time = client._decode_server_wait_time
+                client_tokps = decode.tokens / client_time if client_time > 0 else float("inf")
+                server_wait_pct = (server_wait_time / decode.seconds * 100) if decode.seconds > 0 else 0.0
+                print(f"  └─ Client work: {client_time:.3f}s ({client_tokps:.1f} tok/s)")
+                print(f"  └─ Server wait: {server_wait_time:.3f}s ({server_wait_pct:.1f}% of decode)")
             total_tokens += decode.tokens
             total_seconds += decode.seconds
 
