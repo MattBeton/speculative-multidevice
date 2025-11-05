@@ -94,7 +94,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Benchmark roundtrip latency between client and server"
     )
-    ap.add_argument("--host", default="100.116.69.48", help="Server host")
+    ap.add_argument("--host", default="192.168.200.2", help="Server host")
     ap.add_argument("--port", type=int, default=7070, help="Server port")
     ap.add_argument(
         "-i", "--iterations", type=int, default=100,

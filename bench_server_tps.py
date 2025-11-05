@@ -209,7 +209,7 @@ async def run_bench(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="100.116.69.48")
+    ap.add_argument("--host", default="192.168.200.2")
     ap.add_argument("--port", type=int, default=7070)
     ap.add_argument("--tokenizer", default="meta-llama/Llama-3.2-3B-Instruct")
     ap.add_argument("-b", "--batch", type=int, default=8)
