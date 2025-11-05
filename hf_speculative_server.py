@@ -94,9 +94,12 @@ class BatchVerifier:
         draft_topk_idx: list[list[list[int]]],
     ) -> VerifyResponse:
         print(draft_toks)
+
+        # Handle empty drafts
+        orig_draft_toks = draft_toks
         draft_toks = [
             x if len(x) != 0 else [PAD_ID] * 9
-            for x in draft_toks 
+            for x in draft_toks
         ]
         assert all([len(x) == len(draft_toks[0]) for x in draft_toks])
         x = torch.tensor(draft_toks, dtype=torch.long, device=DEVICE)
@@ -109,34 +112,83 @@ class BatchVerifier:
 
         self.tokens = [x + y for x, y in zip(self.tokens, draft_toks)]
 
-        # Get logits from model output
-        logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
+        # Get logits and compute top-k for base model
+        logits = outputs.logits  # (batch_size, seq_len, vocab_size)
+        base_topk_vals, base_topk_idx = torch.topk(logits, TOP_K, dim=-1)
 
-        # TODO: Logic to use logits for acceptance.
-        # For now, using random acceptance for testing
         accept_values = []
-        import random
-        for _ in range(len(draft_toks)):
-            accept_values.append(random.randint(1, len(draft_toks[0])))
-
-        # Sample base tokens from the accepted position's logits
         base_tokens = []
-        for i, accepted in enumerate(accept_values):
-            accepted_logits = logits[i, accepted-1, :]  # (vocab_size,)
+        hit_eos = []
 
-            top_k_logits, top_k_indices = torch.topk(accepted_logits, TOP_K)
-            probs = torch.softmax(top_k_logits, dim=-1)
+        # Process each stream
+        for i in range(len(draft_toks)):
+            # Handle empty draft (finished stream)
+            if len(orig_draft_toks[i]) == 0:
+                accept_values.append(0)
+                base_tokens.append(-1)
+                hit_eos.append(True)
+                continue
 
-            # Sample from the top-k distribution
-            sampled_idx = torch.multinomial(probs, num_samples=1, generator=GENERATOR["cuda" if DEVICE.type == "cuda" else "cpu"])
-            sampled_token = top_k_indices[sampled_idx].item()
+            accepted = 0
+            hit_eos_flag = False
 
-            base_tokens.append(sampled_token)
+            # Verify each draft token
+            for j in range(len(orig_draft_toks[i])):
+                tok = draft_toks[i][j]
+
+                # Get draft logit (raw)
+                d_idx = torch.tensor(draft_topk_idx[i][j], device=DEVICE)
+                d_vals = torch.tensor(draft_topk_vals[i][j], device=DEVICE)
+                d_mask = (d_idx == tok)
+                if d_mask.sum() != 1:
+                    raise RuntimeError(f"draft top-k must contain sampled token (stream {i}, pos {j})")
+                draft_logit = d_vals[d_mask].item()
+
+                # Get base logit (raw)
+                b_idx = base_topk_idx[i, j]
+                b_vals = base_topk_vals[i, j]
+                b_mask = (b_idx == tok)
+                in_base_topk = b_mask.any()
+                base_logit = b_vals[b_mask].item() if in_base_topk else float("-inf")
+
+                # Acceptance logic
+                if base_logit == float("-inf"):
+                    break
+                elif draft_logit <= base_logit:
+                    accepted += 1
+                else:
+                    # Convert to probabilities for ratio calculation
+                    draft_prob = torch.softmax(d_vals, dim=-1)[d_mask].item()
+                    base_prob = torch.softmax(b_vals, dim=-1)[b_mask].item() if in_base_topk else 0.0
+                    u = PY_RNG.uniform(0.0, 1.0)
+                    if u <= (base_prob / draft_prob):
+                        accepted += 1
+                    else:
+                        break
+
+                # Check EOS
+                if self.tok.eos_token_id and tok == self.tok.eos_token_id:
+                    hit_eos_flag = True
+                    break
+
+            # Sample base fallback token if not EOS
+            if not hit_eos_flag:
+                accepted_logits = logits[i, accepted]
+                top_k_logits, top_k_indices = torch.topk(accepted_logits, TOP_K)
+                probs = torch.softmax(top_k_logits, dim=-1)
+                sampled_idx = torch.multinomial(probs, 1, generator=GENERATOR[DEVICE.type])
+                base_token = top_k_indices[sampled_idx].item()
+            else:
+                base_token = -1
+
+            accept_values.append(accepted)
+            base_tokens.append(base_token)
+            hit_eos.append(hit_eos_flag)
+
+        print(accept_values)
 
         rollback_values = [len(draft_toks[0]) - y for y in accept_values]
         rollback_dynamic_per_row_simple(self.cache, self.tokens, rollback_values)
-
-        hit_eos = [False for _ in range(len(draft_toks))]
 
         return VerifyResponse(
             accepted_len=accept_values,
