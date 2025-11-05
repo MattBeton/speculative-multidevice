@@ -19,7 +19,7 @@
 import asyncio
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -63,19 +63,25 @@ class BatchVerifier:
         self.cache = DynamicCache()
         self.tokens: List[List[int]] = []   # per-stream committed tokens (prefix-only at prefill, then grow)
         self.last:   List[int] = []         # per-stream "last token" to start each verify step
+        self.post_verify_task: Optional[asyncio.Task[None]] = None
 
         # timing
         self.verify_iterations = 0
         self.total_forward_time = 0.0
+        self.total_post_model_time = 0.0
         self.total_e2e_time = 0.0
         self.total_tokens_processed = 0
 
     async def reset(self) -> None:
+        if self.post_verify_task is not None and not self.post_verify_task.done():
+            await self.post_verify_task
         self.cache = DynamicCache()
         self.tokens = []
         self.last = []
+        self.post_verify_task = None
         self.verify_iterations = 0
         self.total_forward_time = 0.0
+        self.total_post_model_time = 0.0
         self.total_e2e_time = 0.0
         self.total_tokens_processed = 0
 
@@ -96,6 +102,10 @@ class BatchVerifier:
         draft_topk_vals: list[list[list[float]]],
         draft_topk_idx: list[list[list[int]]],
     ) -> VerifyResponse:
+        # Check that post_verify coroutine is not running - if it's running then await it
+        if self.post_verify_task is not None and not self.post_verify_task.done():
+            await self.post_verify_task
+        
         B = len(draft_toks)
 
         # All streams must share the same K in this simple batch path
@@ -113,11 +123,16 @@ class BatchVerifier:
         toks_verify = torch.tensor(rows, dtype=torch.long, device=DEVICE)  # (B, K+1)
 
         # Forward once with the existing batched cache
+        model_start = time.perf_counter()
         outputs = self.model(
             toks_verify,
             use_cache=True,
             past_key_values=self.cache
         )
+        model_end = time.perf_counter()
+        model_time = model_end - model_start
+        
+        post_model_start = time.perf_counter()
         logits = outputs.logits  # (B, K+1, V)
         base_topk_vals, base_topk_idx = torch.topk(logits, TOP_K, dim=-1)
 
@@ -192,6 +207,38 @@ class BatchVerifier:
             accepted.append(m)
             hit_eos.append(eos_hit)
 
+        # Spawn post_verify ready for the next request
+        self.post_verify_task = asyncio.create_task(
+            self.post_verify(outputs, draft_toks, accepted, hit_eos, base_tok)
+        )
+
+        post_model_end = time.perf_counter()
+        post_model_time = post_model_end - post_model_start
+        
+        # Update timing statistics
+        self.verify_iterations += 1
+        self.total_forward_time += model_time
+        self.total_post_model_time += post_model_time
+        # Count tokens processed (sum of accepted + base tokens appended)
+        tokens_this_batch = sum(accepted) + sum(1 for eos in hit_eos if not eos)
+        self.total_tokens_processed += tokens_this_batch
+
+        return VerifyResponse(
+            accepted_len=[int(x) for x in accepted],
+            base_token=[int(x) for x in base_tok],
+            hit_eos=[bool(x) for x in hit_eos],
+        )
+
+    async def post_verify(
+        self,
+        outputs: Any,
+        draft_toks: list[list[int]],
+        accepted: list[int],
+        hit_eos: list[bool],
+        base_tok: list[int],
+    ) -> None:
+        B = len(accepted)
+
         # ---- Commit: slice returned KV and advance tokens/last ----
         # outputs.past_key_values has past_len + (1 + stream_K) new steps per stream
         new_cache = outputs.past_key_values  # DynamicCache
@@ -225,11 +272,6 @@ class BatchVerifier:
                 # EOS hit: set last to final accepted draft token
                 self.last[i] = int(draft_toks[i][accepted[i]-1]) if accepted[i] > 0 else self.last[i]
 
-        return VerifyResponse(
-            accepted_len=[int(x) for x in accepted],
-            base_token=[int(x) for x in base_tok],
-            hit_eos=[bool(x) for x in hit_eos],
-        )
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, verifier: BatchVerifier) -> None:
@@ -262,18 +304,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         # Print timing summary
         if verifier.verify_iterations > 0:
             avg_fwd = verifier.total_forward_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
-            avg_e2e = verifier.total_e2e_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
+            avg_post = verifier.total_post_model_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
             avg_tps_fwd = verifier.total_tokens_processed / verifier.total_forward_time if verifier.total_forward_time > 0 else 0.0
-            avg_tps_e2e = verifier.total_tokens_processed / verifier.total_e2e_time if verifier.total_e2e_time > 0 else 0.0
+            avg_tps_post = verifier.total_tokens_processed / verifier.total_post_model_time if verifier.total_post_model_time > 0 else 0.0
             print(f"\n[BATCH SERVER TIMING SUMMARY]")
             print(f"  Total verify iterations: {verifier.verify_iterations}")
             print(f"  Total tokens processed:  {verifier.total_tokens_processed}")
-            print(f"  Total forward time:      {verifier.total_forward_time:.4f}s")
-            print(f"  Total end-to-end time:   {verifier.total_e2e_time:.4f}s")
-            print(f"  Avg time/verify (fwd):   {avg_fwd:.4f}s")
-            print(f"  Avg time/verify (e2e):   {avg_e2e:.4f}s")
-            print(f"  Avg tokens/sec (fwd):    {avg_tps_fwd:.2f}")
-            print(f"  Avg tokens/sec (e2e):    {avg_tps_e2e:.2f}")
+            print(f"  Total model call time:   {verifier.total_forward_time:.4f}s")
+            print(f"  Total post-model time:   {verifier.total_post_model_time:.4f}s")
+            print(f"  Avg time/verify (model): {avg_fwd:.4f}s")
+            print(f"  Avg time/verify (post):  {avg_post:.4f}s")
+            print(f"  Avg tokens/sec (model):  {avg_tps_fwd:.2f}")
+            print(f"  Avg tokens/sec (post):   {avg_tps_post:.2f}")
         await channel.close()
 
 
