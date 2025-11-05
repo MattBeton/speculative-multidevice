@@ -13,6 +13,7 @@ from shared import (
     PrefillRequest,
     PrefillResponse,
     ResetRequest,
+    ResetResponse,
     VerifyRequest,
     VerifyResponse,
     run_mlx,
@@ -81,8 +82,11 @@ class BatchDraftClient:
         ]
 
     async def reset_remote(self) -> None:
-        """Send reset request to server."""
+        """Send reset request to server and wait for acknowledgment."""
         await self._channel.send(ResetRequest())
+        resp = await self._channel.recv()
+        if not isinstance(resp, ResetResponse):
+            raise RuntimeError(f"expected ResetResponse, got {type(resp)!r}")
 
     async def prefill_both(self, timer: TokenTimer) -> None:
         """Tokenize + prefill locally; send prefill request remotely."""
