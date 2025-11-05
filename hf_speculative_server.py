@@ -136,76 +136,97 @@ class BatchVerifier:
         logits = outputs.logits  # (B, K+1, V)
         base_topk_vals, base_topk_idx = torch.topk(logits, TOP_K, dim=-1)
 
-        accepted = []
-        base_tok = []
-        hit_eos  = []
+        # ------- Vectorized accept + fallback sampling -------
+        # base_topk_* already computed on GPU: (B, K+1, TOP_K)
+        # We will:
+        #   1) compute accept mask for every (stream, position) in one shot
+        #   2) turn that mask into "m" (accepted prefix length) via cumprod/sum
+        #   3) sample fallback token from row m per stream in one multinomial()
+        B, KP1, k = base_topk_idx.shape
+        K = KP1 - 1
+        device = logits.device
 
-        # Per-stream acceptance using the same "logits-based" rule as the MLX client
-        for i in range(B):
-            stream_K = len(draft_toks[i])
-            if stream_K == 0:
-                # No drafts: take fallback row 0
-                row_logits = logits[i, 0]
-                tk_vals, tk_idx = torch.topk(row_logits, TOP_K, dim=-1)
-                probs = torch.softmax(tk_vals, dim=-1)
-                choice = torch.multinomial(probs, 1, generator=GENERATOR[DEVICE.type]).item()
-                tok = int(tk_idx[choice].item())
-                accepted.append(0)
-                base_tok.append(tok)
-                hit_eos.append(False)
-                continue
+        # Streams with drafts (either K or 0 by earlier assert)
+        active_mask = torch.tensor([len(x) > 0 for x in draft_toks], device=device)
+        all_rows = torch.arange(B, device=device)
 
-            m = 0
-            eos_hit = False
-            for j in range(stream_K):
-                tok = int(draft_toks[i][j])
+        # Defaults for every stream (including empty)
+        accepted = torch.zeros(B, dtype=torch.long, device=device)
+        hit_eos  = torch.zeros(B, dtype=torch.bool, device=device)
 
-                # draft row j
-                d_idx = torch.tensor(draft_topk_idx[i][j], device=DEVICE, dtype=torch.long)
-                d_val = torch.tensor(draft_topk_vals[i][j], device=DEVICE, dtype=logits.dtype)
-                pos = (d_idx == tok).nonzero(as_tuple=False)
-                if pos.numel() != 1:
-                    # sample not in draft top-k (shouldn't happen if sampled from it)
-                    break
-                draft_logit = float(d_val[pos[0, 0]].item())
+        if active_mask.any():
+            act_idx = active_mask.nonzero(as_tuple=False).squeeze(-1)  # (Ba,)
+            Ba = act_idx.numel()
 
-                # base row j (aligned because we fed [last] + drafts)
-                b_idx = base_topk_idx[i, j]
-                b_val = base_topk_vals[i, j]
-                posb = (b_idx == tok).nonzero(as_tuple=False)
-                if posb.numel() == 0:
-                    # token not in base top-k -> reject
-                    break
-                base_logit = float(b_val[posb[0, 0]].item())
+            # Pack draft tensors for active streams only
+            # shapes: (Ba, K), (Ba, K, k), (Ba, K, k)
+            draft_tokens_t = torch.tensor([draft_toks[i]       for i in act_idx], dtype=torch.long,       device=device)
+            d_idx_t        = torch.tensor([draft_topk_idx[i]   for i in act_idx], dtype=torch.long,       device=device)
+            d_val_t        = torch.tensor([draft_topk_vals[i]  for i in act_idx], dtype=logits.dtype,     device=device)
 
-                if draft_logit <= base_logit:
-                    m += 1
-                else:
-                    u = PY_RNG.uniform(0.0, 1.0)
-                    # keep the same (approximate) rule as the MLX client
-                    # if you want the exact rule, use math.exp(base_logit - draft_logit)
-                    accept = (u <= (base_logit / draft_logit))
-                    if not accept:
-                        break
-                    m += 1
+            # Base top‑k rows aligned to verification positions 0..K‑1
+            base_idx_v = base_topk_idx[act_idx, :K, :]   # (Ba, K, k)
+            base_val_v = base_topk_vals[act_idx, :K, :]  # (Ba, K, k)
 
-                if (self.tok.eos_token_id is not None) and (tok == self.tok.eos_token_id):
-                    eos_hit = True
-                    break
+            # Locate the sampled draft token in the base/draft top‑k rows
+            # -> base_logit & draft_logit tensors, both (Ba, K)
 
-            # Base fallback token from row m if EOS not hit
-            if not eos_hit:
-                row_logits = logits[i, m]   # row m is the fallback distribution
-                tk_vals, tk_idx = torch.topk(row_logits, TOP_K, dim=-1)
-                probs = torch.softmax(tk_vals, dim=-1)
-                choice = torch.multinomial(probs, 1, generator=GENERATOR[DEVICE.type]).item()
-                tok = int(tk_idx[choice].item())
-                base_tok.append(tok)
+            # Base: where is tok in base top‑k?
+            eq_b      = (base_idx_v == draft_tokens_t.unsqueeze(-1))   # (Ba, K, k)
+            present_b = eq_b.any(-1)                                   # (Ba, K)
+            pos_b     = eq_b.float().argmax(-1)                        # (Ba, K) — first True index
+            base_logit = base_val_v.gather(-1, pos_b.unsqueeze(-1)).squeeze(-1)  # (Ba, K)
+
+            # Draft: where is tok in draft top‑k?
+            eq_d      = (d_idx_t == draft_tokens_t.unsqueeze(-1))      # (Ba, K, k)
+            present_d = eq_d.any(-1)                                   # (Ba, K)
+            pos_d     = eq_d.float().argmax(-1)                        # (Ba, K)
+            draft_logit = d_val_t.gather(-1, pos_d.unsqueeze(-1)).squeeze(-1)    # (Ba, K)
+
+            # MLX-style approximate accept rule: accept if base>=draft,
+            # otherwise with prob ~ (base_logit / draft_logit).
+            base_ge = base_logit >= draft_logit
+            ratio   = base_logit / (draft_logit + 1e-9)                # same semantics as before
+            U       = torch.rand_like(ratio)
+            accept  = present_b & present_d & (base_ge | (U <= ratio)) # (Ba, K)
+
+            # Stop on accepted EOS (include that position in 'm' then stop)
+            eos_id = getattr(self.tok, "eos_token_id", None)
+            if eos_id is not None:
+                eos_mask      = (draft_tokens_t == int(eos_id))        # (Ba, K)
+                eos_accepted  = eos_mask & accept                      # (Ba, K)
+                idxs          = torch.arange(K, device=device).unsqueeze(0).expand_as(eos_accepted)
+                eos_pos       = torch.where(eos_accepted, idxs, torch.full_like(idxs, K))
+                first_eos     = eos_pos.min(dim=1).values              # (Ba,)
+                eos_hit_act   = first_eos < K
+                m_eos_limit   = torch.where(eos_hit_act, first_eos + 1, torch.full_like(first_eos, K))
             else:
-                base_tok.append(-1)  # use -1 to signal None on the wire
+                eos_hit_act = torch.zeros(accept.shape[0], dtype=torch.bool, device=device)
+                m_eos_limit = torch.full((accept.shape[0],), K, dtype=torch.long, device=device)
 
-            accepted.append(m)
-            hit_eos.append(eos_hit)
+            # Stop at first reject: cumprod gives 1 while all previous accepts are True
+            accepted_prefix = accept.to(torch.int32).cumprod(dim=1)    # (Ba, K)
+            m_reject_limit  = accepted_prefix.sum(dim=1)               # (Ba,)
+
+            # Final accepted length m for each active stream
+            m_act = torch.minimum(m_reject_limit, m_eos_limit)         # (Ba,)
+
+            accepted[act_idx] = m_act
+            hit_eos[act_idx]  = eos_hit_act
+
+        # Sample fallback/base token row-wise from row 'm' (row 0 for empty streams)
+        row_idx   = accepted.clamp(max=K)                              # (B,)
+        sel_vals  = base_topk_vals[all_rows, row_idx, :]               # (B, k)
+        sel_idx   = base_topk_idx [all_rows, row_idx, :]               # (B, k)
+        probs     = torch.softmax(sel_vals, dim=-1)
+        choice    = torch.multinomial(probs, 1, generator=GENERATOR[DEVICE.type])  # (B, 1)
+        base_tok  = sel_idx.gather(-1, choice).squeeze(-1)             # (B,)
+        base_tok  = base_tok.masked_fill(hit_eos, -1)                  # -1 signals None on the wire
+
+        accepted = accepted.tolist()
+        base_tok = base_tok.tolist()
+        hit_eos  = hit_eos.tolist()
+        # ------- end vectorized block -------
 
         # Spawn post_verify ready for the next request
         self.post_verify_task = asyncio.create_task(
@@ -316,6 +337,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             print(f"  Avg time/verify (post):  {avg_post:.4f}s")
             print(f"  Avg tokens/sec (model):  {avg_tps_fwd:.2f}")
             print(f"  Avg tokens/sec (post):   {avg_tps_post:.2f}")
+            # Reset timing statistics for the next client connection
+            verifier.verify_iterations = 0
+            verifier.total_forward_time = 0.0
+            verifier.total_post_model_time = 0.0
+            verifier.total_e2e_time = 0.0
+            verifier.total_tokens_processed = 0
         await channel.close()
 
 
