@@ -56,6 +56,7 @@ class BatchVerifier:
         self.total_post_model_time = 0.0
         self.total_tokens_processed = 0
         self.total_positions_verified = 0
+        self.verify_step_counter = 0  # DEBUG: Track verify step number
 
     async def reset(self) -> None:
         if self.post_verify_task is not None and not self.post_verify_task.done():
@@ -89,6 +90,9 @@ class BatchVerifier:
         # Ensure previous commit finished before using self.cache again.
         if self.post_verify_task is not None and not self.post_verify_task.done():
             await self.post_verify_task
+        
+        self.verify_step_counter += 1
+        verify_step = self.verify_step_counter
 
         B = len(draft_toks)
         K = max(len(x) for x in draft_toks) if B else 0
@@ -99,6 +103,7 @@ class BatchVerifier:
         for i in range(B):
             if len(draft_toks[i]) == 0:
                 rows.append([self.last[i]])
+                raise Exception('this shouldnt happen')
             else:
                 rows.append([self.last[i]] + [int(t) for t in draft_toks[i]])
         x = torch.tensor(rows, dtype=torch.long, device=DEVICE)  # (B, K+1)
@@ -106,6 +111,14 @@ class BatchVerifier:
         # 1) forward
         t0 = time.perf_counter()
         outputs = self.model(input_ids=x, use_cache=True, past_key_values=self.cache)
+
+        # DEBUG: Print KV cache strip from layer 10 (for shorter prompt in batch)
+        # Find the shorter prompt (smaller len in self.lens)
+        if len(self.lens) > 1:
+            shorter_idx = min(range(len(self.lens)), key=lambda i: self.lens[i])
+        else:
+            shorter_idx = 0
+        
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -114,6 +127,14 @@ class BatchVerifier:
         # 2) accept + choose fallback (no global top-k)
         t2 = time.perf_counter()
         logits = outputs.logits  # (B, K+1, V)
+        
+        # DEBUG: Print topk logits for each token in verify step (for shorter prompt in batch)
+        # Find the shorter prompt (smaller len in self.lens)
+        if len(self.lens) > 1:
+            shorter_idx = min(range(len(self.lens)), key=lambda i: self.lens[i])
+        else:
+            shorter_idx = 0
+        
         accepted, base_tok, hit_eos = self._accept_and_choose(
             logits, draft_toks, draft_topk_idx, draft_topk_vals
         )
@@ -122,7 +143,7 @@ class BatchVerifier:
 
         # 3) spawn commit
         self.post_verify_task = asyncio.create_task(
-            self._commit(outputs.past_key_values, draft_toks, accepted, hit_eos, base_tok)
+            self._commit(outputs.past_key_values, draft_toks, [K - x for x in accepted], hit_eos, base_tok)
         )
 
         # metrics
@@ -151,7 +172,7 @@ class BatchVerifier:
         d_idx: List[List[List[int]]],                    # (B, K, k) as lists
         d_val: List[List[List[float]]],                  # (B, K, k) as lists
         sample_mode: str = "argmax",                     # "argmax" (fast) or "topk"
-        sample_topk: int = 8,                            # used only if sample_mode == "topk"
+        sample_topk: int = 20,                            # used only if sample_mode == "topk"
     ) -> Tuple[List[int], List[int], List[bool]]:
         B, KP1, V = logits.shape
         K = KP1 - 1
@@ -207,7 +228,7 @@ class BatchVerifier:
             m_reject_limit = accepted_prefix.sum(dim=1)              # (Ba,)
 
             m_act = torch.minimum(m_reject_limit, m_eos_limit)       # (Ba,)
-            accepted[act] = m_act
+            accepted[act]  = m_act
             hit_eos[act] = eos_hit_act
 
         # Row m per stream; clamp at K for safety.
@@ -234,82 +255,66 @@ class BatchVerifier:
     # Keeps shape small and avoids growing S across rounds.
     # ------------------------------------------------------------
 
+
     async def _commit(
         self,
-        new_cache: DynamicCache,
-        draft_toks: List[List[int]],
-        accepted: List[int],
-        hit_eos: List[bool],
-        base_tok: List[int],
+        cache: DynamicCache,
+        draft_tokens: list[list[int]], 
+        rollback: list[int],
+        hit_eos: list[bool],
+        base_tok: list[int],
     ) -> None:
-        B = len(accepted)
-        if B == 0:
-            return
+        """
+        Roll back r[i] tokens for each batch row i in a DynamicCache.
+        The output cache maintains the same sequence length as the input, padding with zeros where needed.
+        """
+        assert cache.layers[0].keys is not None and cache.layers[0].values is not None
+        B = len(draft_tokens)
 
-        # Per-stream counts
-        keep   = [accepted[i] + (0 if hit_eos[i] else 1) for i in range(B)]
-        L_prev = self.lens
-        L_new  = [L_prev[i] + keep[i] for i in range(B)]
+        print(f'{rollback=}')
 
-        # Old unified length (what's currently in self.cache)
-        old_legacy = self.cache.to_legacy_cache()
-        if len(old_legacy) == 0 or len(old_legacy[0]) == 0:
-            raise RuntimeError("Cannot commit with empty cache - prefill must be called first")
-        S_prev = old_legacy[0][0].shape[2]  # (B, H, S_prev, D)
+        L_prev = [x + len(draft_tokens[0]) + 1 for x in self.lens]
+        L_new  = [L_prev[i] - rollback[i] for i in range(B)]
 
-        # New unified length target after commit
-        S_target = max(L_new) if L_new else 0
-
-        # New cache returned by the forward
-        new_legacy = new_cache.to_legacy_cache()  # (B, H, S_src, D) with S_src = S_prev + (K+1) for non-empty rows
+        S_prev = cache.layers[0].keys.shape[2]
+        S_target = max(L_new)
 
         dst = DynamicCache()
-        for layer, ((k_old, v_old), (k_b, v_b)) in enumerate(zip(old_legacy, new_legacy)):
-            # Shapes: k_old: (B, H, S_prev, D), k_b: (B, H, S_src, D)
-            B0, H, S_prev_chk, D = k_old.shape
-            assert B0 == B and S_prev_chk == S_prev
+        for layer in range(len(cache)):
+            K = cache.layers[layer].keys
+            V = cache.layers[layer].values
+            assert K is not None and V is not None
 
-            # Note: S_src can differ per layer but is consistent across rows in practice.
-            _, _, S_src, _ = k_b.shape
+            _, H, _, D = K.shape
 
-            k_out = k_b.new_zeros((B, H, S_target, D))
-            v_out = v_b.new_zeros((B, H, S_target, D))
+            K_new = K.new_zeros((B, H, S_target, D))
+            V_new = V.new_zeros((B, H, S_target, D))
 
+            # Copy per row
             for i in range(B):
-                Lp = int(L_prev[i])
-                ki = int(keep[i])
-                Ln = int(L_new[i])
-                dst_start = S_target - Ln
+                keep = L_new[i]
+                if keep <= 0:
+                    continue
 
-                # 1) Copy the previous committed prefix from OLD cache
-                if Lp > 0:
-                    src_prev_start = S_prev - Lp
-                    k_prefix = k_old[i:i+1, :, src_prev_start:S_prev, :].contiguous()  # (1,H,Lp,D)
-                    v_prefix = v_old[i:i+1, :, src_prev_start:S_prev, :].contiguous()
-                    k_out[i:i+1, :, dst_start:dst_start+Lp, :] = k_prefix
-                    v_out[i:i+1, :, dst_start:dst_start+Lp, :] = v_prefix
+                lhs_start = S_prev - L_prev[i]
+                lhs_end = lhs_start + keep
 
-                # 2) Append the new committed tail from the END of NEW cache
-                if ki > 0:
-                    k_tail = k_b[i:i+1, :, S_src-ki:S_src, :].contiguous()  # (1,H,ki,D)
-                    v_tail = v_b[i:i+1, :, S_src-ki:S_src, :].contiguous()
-                    k_out[i:i+1, :, dst_start+Lp:dst_start+Lp+ki, :] = k_tail
-                    v_out[i:i+1, :, dst_start+Lp:dst_start+Lp+ki, :] = v_tail
+                K_src = K[i, :, lhs_start:lhs_end, :]
+                V_src = V[i, :, lhs_start:lhs_end, :]
 
-            dst.update(k_out, v_out, layer)
+                start = S_target - L_new[i]
 
-        # Swap in compacted cache
+                K_new[i, :, start:, :] = K_src
+                V_new[i, :, start:, :] = V_src
+
+            dst.update(K_new, V_new, layer)
+
         self.cache = dst
-
-        # Advance "last" and lengths
         for i in range(B):
-            if not hit_eos[i]:
-                self.last[i] = int(base_tok[i])
-            elif accepted[i] > 0:
-                self.last[i] = int(draft_toks[i][accepted[i] - 1])
+            self.last[i] = int(base_tok[i])
             self.lens[i] = int(L_new[i])
 
-
+ 
 # ------------------------------------------------------------
 # Server plumbing (unchanged except for new class)
 # ------------------------------------------------------------

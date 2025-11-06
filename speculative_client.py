@@ -30,6 +30,11 @@ PROMPTS: List[str] = [
     "Why is the sky blue?",
     "Explain speculative decoding in simple terms.",
     "Write a sonnet about the iPhone.",
+    "What are the benefits of renewable energy?",
+    "Describe the process of photosynthesis.",
+    "How does machine learning work?",
+    "What is the difference between AI and AGI?",
+    "Explain the theory of relativity.",
 ]
 
 SPEC_K = 8
@@ -47,7 +52,6 @@ class StreamDraft:
         self.model = MLXGenerationModel(model_path)
         self.eos = self.model.eos_token_id()
         self.ids: Optional[np.ndarray] = None   # tokenized full prompt
-        self.prompt_last: Optional[int] = None  # last token of prompt
 
         self.generated: List[int] = []
         self.last_token: Optional[int] = None   # last committed token for next round
@@ -63,8 +67,7 @@ class StreamDraft:
             raise RuntimeError("empty tokenized prompt")
         prefix = self.ids[:-1]
         await run_mlx(self.model.forward, prefix, False)
-        self.prompt_last = int(self.ids[-1])
-        self.last_token = self.prompt_last
+        self.last_token = int(self.ids[-1])
 
     def token_budget_used(self) -> int:
         return len(self.ids) - 1 if self.ids is not None else 0
@@ -97,22 +100,17 @@ class BatchDraftClient:
             for stream, prompt in zip(self._streams, self._prompts)
         ))
 
-        # 2) Prepare prompts for remote prefill (list of list of ints)
         prompts: List[List[int]] = []
         for stream in self._streams:
-            if stream.ids is not None:
-                # Convert numpy array to list of ints
-                prompts.append(stream.ids.astype(int).tolist())
+            prompts.append(stream.ids.astype(int).tolist())
 
-        # 3) Prefill local and remote
-        with timer.measure("prefill", lambda: sum(st.token_budget_used() for st in self._streams)):
-            # Prefill local models
+        with timer.measure("prefill", lambda: sum(len(st.ids) - 1 for st in self._streams)):
+            # TODO: Put this as a single prefil, do both simultaneously.
             await asyncio.gather(*(
                 stream.prefill_local()
                 for stream in self._streams
             ))
 
-            # Prefill remote
             await self._channel.send(PrefillRequest(prompts=prompts))
             msg = await self._channel.recv()
             if not isinstance(msg, PrefillResponse):

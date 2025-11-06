@@ -93,7 +93,6 @@ class BatchVerifierSession:
                 self.models[i].forward, toks_verify, False
             )
             # Shapes: base_toks -> (K+1,), b_topk_idx/vals -> (K+1, top_k)
-
             accepted = 0
             hit_eos = False
 
@@ -194,9 +193,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main() -> None:
-    server = await asyncio.start_server(handle_client, "127.0.0.1", 7070)
+    import os
+    PORT = int(os.environ.get("MLX_SPEC_PORT", "7070"))  # Default to 7071 to avoid conflict with HF server
+    server = await asyncio.start_server(handle_client, "127.0.0.1", PORT)
     addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
-    print(f"Verifier listening on {addrs}")
+    print(f"MLX Verifier listening on {addrs}")
     async with server:
         await server.serve_forever()
 
