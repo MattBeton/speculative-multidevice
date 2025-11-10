@@ -105,7 +105,9 @@ class MLXGenerationModel(GenerationModel):
         mx.random.seed(SEED)
         self.model, self.config = load_model(model_path)
         self.tok = load_tokenizer(model_path)
+
         self.cache = make_prompt_cache(self.model) # for rotating kv cache: make_prompt_cache(model, max_kv_size=4096)
+        self.tokens: np.array | None = None
 
     def reset(self) -> None:
         """Reset KV cache to empty."""
@@ -120,27 +122,47 @@ class MLXGenerationModel(GenerationModel):
         for c in self.cache:
             c.trim(n)
 
+    def add_tokens(self, tokens: np.array):
+        if self.tokens is None:
+            self.tokens = tokens
+        else:
+            assert len(self.tokens.shape) == 2
+            assert self.tokens.shape[0] == tokens.shape[0]
+            self.tokens = np.concatenate([self.tokens, tokens], axis=1)
+
     def forward(self, tokens: np.array, only_final=True) -> np.array:
-        tokens_mlx = mx.array(tokens.reshape((1, -1)), dtype=mx.int32)
+        self.add_tokens(tokens)
+
+        tokens_mlx = mx.array(tokens, dtype=mx.int32)
 
         logits = self.model(tokens_mlx, cache=self.cache)                  # (1, T0, V), cache is filled in-place
 
         if only_final:
             logits = logits[:, -1, :]
 
-        ## TODO: When we figure out MLX topk
         tok, topk_idx, topk_vals = topk_sample_mlx(logits, TOP_K)
         mx.eval(tok, topk_idx, topk_vals)
 
         return np.asarray(tok.astype(mx.int32)), np.asarray(topk_idx.astype(mx.int32)), np.asarray(topk_vals.astype(mx.float32))
 
+    def rollback_tokens(self, r: list[int]):
+        '''
+        Roll back self.tokens and self.cache by r[i] for each prompt.
+        Requires a reshuffle of self.cache to ensure right-alignedness
+        '''
+        ...
+
     def tokenize(self, prompt: str) -> np.array:
         return np.array(self.tok.apply_chat_template(
             [{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=True
         ))
-    
+
     def decode(self, generated: list[int]) -> str:
         return self.tok.decode(generated)
 
     def eos_token_id(self) -> int:
         return getattr(self.tok, "eos_token_id", None)
+
+    def pad_id(self) -> int:
+        raise NotImplementedException()
+        return getattr(self.tok, "pad_token_id", None)
