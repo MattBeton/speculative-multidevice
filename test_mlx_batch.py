@@ -80,7 +80,7 @@ def main():
         if cache_keys is not None:
             slice_val = cache_keys[0, 0, :, 0]
             mx.eval(slice_val)
-            print(np.asarray(slice_val))
+            print(np.asarray(slice_val.astype(mx.float32)))
 
     # ---- Per-row rollback by variable amounts (0..7 here; feel free to set up to 10) ----
     # Example rollback vector: [0,1,2,3,4,5,6,7]
@@ -95,7 +95,7 @@ def main():
         if cache_keys is not None:
             slice_val = cache_keys[0, 0, :, 0]
             mx.eval(slice_val)
-            print(np.asarray(slice_val))
+            print(np.asarray(slice_val.astype(mx.float32)))
 
     # After rollback, compute per-row 'last' token to feed the next step
     # last_after = last_nonpad_token_ids(model.tokens, pad_id).reshape(B, 1)

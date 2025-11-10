@@ -173,25 +173,18 @@ class MLXGenerationModel(GenerationModel):
         if t.ndim == 1:
             t = t[None, :]  # (T,) -> (1, T) batch
 
-        if self.tokens is None:
-            self.tokens = t.copy()
-            # If pad id known, compute non-pad lengths per row; else assume full length.
-            if self._pad_id is not None:
-                self.lengths = [int((row != self._pad_id).sum()) for row in self.tokens]
-            else:
-                self.lengths = [int(self.tokens.shape[1])] * int(self.tokens.shape[0])
-        else:
-            assert self.tokens.shape[0] == t.shape[0], "Batch size changed between calls."
-            self.tokens = np.concatenate([self.tokens, t], axis=1)
-            # Decode steps append real tokens: increase length for all rows by t.shape[1]
-            assert self.lengths is not None
-            self.lengths = [L + t.shape[1] for L in self.lengths]
+        assert self.tokens.shape[0] == t.shape[0], "Batch size changed between calls."
+        assert self.lengths is not None
 
-    def forward(self, tokens: np.array, only_final=True) -> np.array:
-        # self.pad_tokens(tokens)
-        self.add_tokens(tokens)
+        self.tokens = np.concatenate([self.tokens, t], axis=1)
+        self.lengths = [L + t.shape[1] for L in self.lengths]
+
+    def forward(self, tokens: np.array, add_tokens=True, only_final=True) -> np.array:
+        if add_tokens:
+            self.add_tokens(tokens)
 
         tokens_mlx = mx.array(tokens, dtype=mx.int32)
+        print(tokens_mlx.shape)
         logits = self.model(tokens_mlx, cache=self.cache)  # (B, T, V)
 
         if only_final:
@@ -206,6 +199,16 @@ class MLXGenerationModel(GenerationModel):
             np.asarray(topk_vals.astype(mx.float32)),
         )
 
+    def prefill(self, tokens: list[list[int]]) -> np.array:
+        self.lengths = [len(prompt) for prompt in tokens]
+
+        # Pad before prefill
+        S = max(self.lengths)
+        self.tokens = np.full((len(tokens), S), 0, dtype=np.int32)
+        for i, prompt in enumerate(tokens):
+            self.tokens[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
+
+        return self.forward(self.tokens, add_tokens=False)
 
     def rollback_tokens(self, r: list[int]) -> None:
         """
@@ -251,11 +254,22 @@ class MLXGenerationModel(GenerationModel):
                 K_src = K[i, :, lhs_start:lhs_end, :]
                 V_src = V[i, :, lhs_start:lhs_end, :]
 
+                # print(K_src[0, :, 0])
+
                 rhs_start = S_target - keep
                 rhs_end = S_target
 
+                # print(S_prev, L_prev[i], r[i])
+                #
+                # print(lhs_start, lhs_end)
+                # print(rhs_start, rhs_end)
+
                 K_new[i, :, rhs_start:rhs_end, :] = K_src
                 V_new[i, :, rhs_start:rhs_end, :] = V_src
+
+                # print(np.array(K_new[0, 0, :, 0].tolist()))
+                
+                # raise Exception('stop')
 
             # Install rebuilt tensors back into this layer
             c.keys = K_new
