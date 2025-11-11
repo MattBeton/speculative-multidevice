@@ -84,7 +84,7 @@ class MLXGenerationModel(GenerationModel):
     @override
     def forward(
             self, 
-            tokens: np.ndarray, 
+            tokens: np.ndarray[Any, np.dtype[np.int32]], 
             add_tokens=True, 
             only_final=True
     ) -> tuple[np.ndarray[Any, np.dtype[np.int32]], np.ndarray[Any, np.dtype[np.int32]], np.ndarray[Any, np.dtype[np.float32]]]:
@@ -109,8 +109,6 @@ class MLXGenerationModel(GenerationModel):
 
     @override
     def prefill(self, tokens: list[list[int]]) -> None:
-        self.reset()
-
         self.lengths = [len(prompt) for prompt in tokens]
 
         n_layers = len(self.model.layers)

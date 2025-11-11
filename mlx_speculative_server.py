@@ -1,11 +1,11 @@
 # mlx_speculative_server.py
 import asyncio
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-from model import MLXGenerationModel
+from mlx_model import MLXGenerationModel
 from shared import (
     MessageChannel,
     PrefillRequest,
@@ -19,156 +19,97 @@ from shared import (
 
 # ---- Configure the base (verifier) model ----
 BASE_MODEL_PATH = next(Path(
-    "/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/"
-).glob("*"))
+    # "/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/"
+    "~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/"
+).expanduser().glob("*"))
 
 
-class BatchVerifierSession:
+class MLXVerifierSession:
     """Batched session state for the base model verifier."""
     def __init__(self) -> None:
-        self.models: List[MLXGenerationModel] = []
-        self._last_tokens: List[Optional[int]] = []
-        self._eos: Optional[int] = None
-
-    def _ensure_models(self, batch_size: int) -> None:
-        """Ensure we have enough models for the batch size."""
-        while len(self.models) < batch_size:
-            model = MLXGenerationModel(BASE_MODEL_PATH)
-            self.models.append(model)
-            self._last_tokens.append(None)
-            if self._eos is None:
-                self._eos = model.eos_token_id()
+        self.model: MLXGenerationModel = MLXGenerationModel(BASE_MODEL_PATH)
+        self.last: list[int | None] = []
+        self._eos: int | None = None
+        self.batch_size: int | None = None
 
     async def reset(self) -> None:
         """Reset all model states."""
-        for model in self.models:
-            await run_mlx(model.reset)
-        self._last_tokens = [None] * len(self.models)
+        await run_mlx(model.reset)
+        self.last = []
+        self.batch_size = None
 
-    async def prefill(self, prompts: List[List[int]]) -> None:
+    async def prefill(self, prompts: list[list[int]]) -> None:
         """Prefill batch of prompts."""
-        batch_size = len(prompts)
-        self._ensure_models(batch_size)
+        self.batch_size = len(prompts)
 
-        # Process each prompt in the batch
-        for i, prompt in enumerate(prompts):
-            if not prompt or len(prompt) < 1:
-                raise ValueError(f"Empty prompt at index {i}")
+        tokens = [prompt[:-1] for prompt in prompts]
+        await run_mlx(self.model.prefill, tokens)
+        self.last = [prompt[-1] for prompt in prompts]
 
-            # Prefill with all but the final token; save the last to start decode
-            prefix = np.array(prompt[:-1], dtype=np.int32)
-            await run_mlx(self.models[i].forward, prefix, False)  # fills cache
-            self._last_tokens[i] = int(prompt[-1])
-
-    async def verify(self, req: VerifyRequest) -> VerifyResponse:
+    async def verify(
+        self, 
+        draft_toks: list[list[int]],
+        draft_topk_idx: list[list[list[int]]],
+        draft_topk_vals: list[list[list[float]]],
+    ) -> VerifyResponse:
         """Verify batch of draft tokens."""
-        batch_size = len(req.draft_toks)
 
-        # Check that we have prefilled all streams
-        for i in range(batch_size):
-            if i >= len(self._last_tokens) or self._last_tokens[i] is None:
-                raise RuntimeError(f"verify called before prefill for stream {i}")
+        K = max(len(x) for x in draft_toks)
+        assert all((len(x) == K) or (len(x) == 0) for x in draft_toks)
 
-        accepted_lens: List[int] = []
-        base_tokens: List[int] = []
-        hit_eos_flags: List[bool] = []
+        # Build [last] + drafts (empty -> [last] only).
+        rows: list[list[int]] = []
+        for i in range(self.batch_size):
+            assert len(draft_toks[i]) != 0, 'this shouldnt happen'
+            rows.append([self.last[i]] + [int(t) for t in draft_toks[i]])
+        x = np.array(rows, dtype=np.int32)  # (B, K+1)
 
-        # Process each stream in the batch
-        for i in range(batch_size):
-            # Handle empty draft (finished stream)
-            if len(req.draft_toks[i]) == 0:
-                accepted_lens.append(0)
-                base_tokens.append(-1)
-                hit_eos_flags.append(True)
-                continue
+        tok, topk_idx, topk_vals = await run_mlx(self.model.forward, x, only_final=False)
 
-            # Convert lists to numpy arrays for this stream
-            draft_toks = np.array(req.draft_toks[i], dtype=np.int32)  # (K,)
-            d_topk_idx = np.array(req.draft_topk_idx[i], dtype=np.int32)  # (K, top_k)
-            d_topk_vals = np.array(req.draft_topk_vals[i], dtype=np.float32)  # (K, top_k)
-
-            # Base verifies positions [0..K], feeding current last + draft tokens
-            toks_verify = np.concatenate((np.array([self._last_tokens[i]], dtype=np.int32), draft_toks))
-            base_toks, b_topk_idx, b_topk_vals = await run_mlx(
-                self.models[i].forward, toks_verify, False
-            )
-            # Shapes: base_toks -> (K+1,), b_topk_idx/vals -> (K+1, top_k)
-            accepted = 0
-            hit_eos = False
-
-            # Verify each draft token
-            for j in range(len(draft_toks)):
-                tok = int(draft_toks[j])
-
-                # Get draft probabilities
-                d_idx_row = d_topk_idx[j]
-                d_val_row = d_topk_vals[j]
-                d_mask = (d_idx_row == tok)
-                if d_mask.sum() != 1:
-                    raise RuntimeError(f"draft top-k must contain the sampled token exactly once (stream {i}, pos {j})")
-                draft_logit = float(d_val_row[d_mask][0])
-
-                # Get base probabilities
-                b_idx_row = b_topk_idx[j]
-                b_val_row = b_topk_vals[j]
-                b_mask = (b_idx_row == tok)
-                in_base_topk = bool(b_mask.any())
-                base_logit = float(b_val_row[b_mask][0]) if in_base_topk else float("-inf")
-
-                # Acceptance logic
-                if base_logit == float("-inf"):
-                    break
-                elif draft_logit <= base_logit:
-                    accepted += 1
-                else:
-                    u = np.random.uniform(0.0, 1.0)
-                    if u <= (base_logit / draft_logit):
-                        accepted += 1
-                    else:
-                        break
-
-                # Check for EOS
-                if self._eos is not None and tok == self._eos:
-                    hit_eos = True
-                    break
-
-            # If EOS not hit, get base fallback token
-            base_token = None
-            base_appended = 0
-            if not hit_eos:
-                base_token = int(base_toks[accepted])
-                base_appended = 1
-
-            # Roll back only the uncommitted verifier steps
-            spec_k = len(draft_toks)
-            base_trim = (spec_k + 1) - (accepted + base_appended)
-            if base_trim > 0:
-                await run_mlx(self.models[i].trim_cache, base_trim)
-
-            # Advance "last" to the committed tail
-            if base_appended == 1:
-                self._last_tokens[i] = base_token
-            elif accepted > 0:
-                self._last_tokens[i] = int(draft_toks[accepted - 1])
-
-            # Collect results for this stream
-            accepted_lens.append(accepted)
-            base_tokens.append(base_token if base_token is not None else -1)  # Use -1 for None
-            hit_eos_flags.append(hit_eos)
-
-        return VerifyResponse(
-            accepted_len=accepted_lens,
-            base_token=base_tokens,
-            hit_eos=hit_eos_flags
+        accepted, base_choice, hit_eos = self._accept_and_choose(
+            topk_idx, topk_vals, draft_toks, draft_topk_idx, draft_topk_vals
         )
 
+        self.last = base_choice
+
+        # TODO: This can go into a separate coroutine.
+        await run_mlx(self.model.rollback_tokens, [K - x for x in accepted])
+
+        return VerifyResponse(
+            accepted_len=accepted,
+            base_token=base_choice,
+            hit_eos=hit_eos,
+        )
+
+    def _accept_and_choose(
+        self,
+        topk_idx: np.ndarray,                            # (B, K+1, k)
+        topk_vals: np.ndarray,                            # (B, K+1, k)
+        draft_toks: List[List[int]],
+        draft_idx: List[List[List[int]]],           # (B, K, k) as lists
+        draft_val: List[List[List[float]]],                  # (B, K, k) as lists
+        sample_mode: str = "argmax",                     # "argmax" (fast) or "topk"
+        sample_topk: int = 20,                            # used only if sample_mode == "topk"
+    ) -> Tuple[List[int], List[int], List[bool]]:
+        K = len(draft_idx[0])
+
+        import random
+        accepted = [random.randint(0, K) for _ in range(self.batch_size)]
+
+        base_choice: list[int] = []
+        for i in range(self.batch_size):
+            base_choice.append(int(topk_idx[i, accepted[i], np.argmax(topk_vals[i, accepted[i], :])]))
+
+        hit_eos = [False for _ in range(self.batch_size)]
+
+        return accepted, base_choice, hit_eos
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Handle a client connection with batched requests."""
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
     channel = MessageChannel(reader, writer)
-    session = BatchVerifierSession()
+    session = MLXVerifierSession()
 
     try:
         while True:
@@ -184,7 +125,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await session.prefill(msg.prompts)
                 await channel.send(PrefillResponse(ok=True))
             elif isinstance(msg, VerifyRequest):
-                resp = await session.verify(msg)
+                resp = await session.verify(
+                    msg.draft_toks,
+                    msg.draft_topk_vals,
+                    msg.draft_topk_idx,
+                )
                 await channel.send(resp)
             else:
                 raise RuntimeError(f"Unhandled message type: {type(msg)!r}")
