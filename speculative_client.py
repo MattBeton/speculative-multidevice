@@ -53,6 +53,10 @@ class DraftClient:
         self.model = MLXGenerationModel(DRAFT_MODEL_PATH)
         self.last: list[int] = None
 
+    @property
+    def batch_size(self) -> int:
+        return len(self._prompts)
+
     async def reset_remote(self) -> None:
         """Send reset request to server and wait for acknowledgment."""
         await self._channel.send(ResetRequest())
@@ -75,7 +79,7 @@ class DraftClient:
             )
 
             async def send_and_recv():
-                await self._channel.send(PrefillRequest(prompts=tokens))
+                await self._channel.send(PrefillRequest(prompts=prompts))
                 return await self._channel.recv()
 
             prefill_remote = asyncio.create_task(send_and_recv())
@@ -107,9 +111,9 @@ class DraftClient:
                 round_count += 1
 
                 # Prepare batch verify request
-                draft_toks_batch: List[List[int]] = []
-                draft_topk_idx_batch: List[List[List[int]]] = []
-                draft_topk_vals_batch: List[List[List[float]]] = []
+                draft_toks_batch: List[List[int]] = [[] for _ in range(self.batch_size)]
+                draft_topk_idx_batch: List[List[List[int]]] = [[] for _ in range(self.batch_size)]
+                draft_topk_vals_batch: List[List[List[float]]] = [[] for _ in range(self.batch_size)]
 
                 # 1) Generate draft tokens for each stream (client work)
                 client_start = time.perf_counter()
@@ -118,21 +122,24 @@ class DraftClient:
                 for _ in range(spec_k):
                     y = np.array([current], dtype=np.int32).reshape(-1, 1)
                     print(y.shape)
-                    tok, s_topk_idx, s_topk_vals = await run_mlx(self.model.forward, y, only_final=False)
+                    tok, s_topk_idx, s_topk_vals = await run_mlx(self.model.forward, y, only_final=False)  # tok: (B, 1), topk: (B, 1, K)
 
-                    draft_toks_batch.append(tok.tolist())
-                    draft_topk_idx_batch.append(s_topk_idx.tolist())
-                    draft_topk_vals_batch.append(s_topk_vals.tolist())
+                    for b in range(self.batch_size):  # Append per-batch-item to maintain (B, S, K) structure
+                        draft_toks_batch[b].append(int(tok[b, 0]))
+                        draft_topk_idx_batch[b].append(s_topk_idx[b, 0, :].tolist())
+                        draft_topk_vals_batch[b].append(s_topk_vals[b, 0, :].tolist())
 
-                    current = tok
-
-                    ## TODO: These are currently getting appended as (S, B, K) not (B, S, K)
+                    current = tok[:, 0].tolist()
 
 
-                ### TMP
-                for b in range(3):
-                    print(self.model.decode(self.model.tokens[b, :]))
-                raise Exception('stop')
+                # ### TMP
+                # for b in range(3):
+                #     print(self.model.decode(self.model.tokens[b, :]))
+                # raise Exception('stop')
+                
+                print(np.array(draft_toks_batch).shape)
+                print(np.array(draft_topk_idx_batch).shape)
+                print(np.array(draft_topk_vals_batch).shape)
 
                 # Pause client timing before server wait
                 client_time_before_server = time.perf_counter() - client_start
@@ -156,60 +163,23 @@ class DraftClient:
 
                 client_start = time.perf_counter()
 
+                await run_mlx(
+                    self.model.rollback_tokens, 
+                    [SPEC_K - r for r in resp.accepted_len]
+                )
 
-
-
-
-                for i, stream in enumerate(self._streams):
-                    # Skip finished streams
-                    if stream.finished:
-                        continue
-
-                    # Extract results for this stream
-                    accepted = resp.accepted_len[i]
-                    base_tok = resp.base_token[i]
-                    hit_eos = resp.hit_eos[i]
-
-                    # Handle -1 as None for base_token
-                    if base_tok == -1:
-                        base_tok = None
-
-                    # Get accepted tokens from draft
-                    accepted_tokens = draft_toks_batch[i][:accepted]
-                    base_appended = 0 if base_tok is None else 1
-
-                    # Commit locally: accepted + optional base
-                    stream.generated.extend(accepted_tokens)
-                    if base_tok is not None:
-                        stream.generated.append(base_tok)
-
-                    # Align local draft KV cache
-                    draft_trim = spec_k - (accepted + base_appended)
-                    if draft_trim > 0:
-                        await run_mlx(stream.model.trim_cache, draft_trim)
-                    elif draft_trim < 0:
-                        # Only possible when m==K and base appended -> catch up one step
-                        last_accepted = draft_toks_batch[i][accepted - 1]
-                        await run_mlx(
-                            stream.model.forward,
-                            np.array([[last_accepted]], dtype=np.int32)
-                        )
-
-                    # Prepare next iteration's "last"
-                    if hit_eos or len(stream.generated) >= max_new_tokens:
-                        stream.finished = True
-                    else:
-                        stream.last_token = base_tok if base_tok is not None else (
-                            accepted_tokens[-1] if accepted_tokens else stream.last_token
-                        )
-                
                 # Accumulate remaining client time for this round
                 client_end = time.perf_counter()
                 total_client_time += client_end - client_start
 
+                self.last = resp.base_token
+
         # Store timing values for reporting
         self._decode_client_time = total_client_time
         self._decode_server_wait_time = total_server_wait_time
+
+        for b in range(self.batch_size):
+            print(self.model.decode(self.model.tokens[b, :]))
 
         # Decode final texts
         return [stream.decoded_text() for stream in self._streams]
