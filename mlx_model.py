@@ -124,7 +124,7 @@ class MLXGenerationModel(GenerationModel):
         for i, prompt in enumerate(tokens):
             self.tokens[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
 
-        self.forward(self.tokens, only_final=True)
+        self.forward(self.tokens, add_tokens=False)
 
     @override
     def rollback_tokens(self, r: list[int]) -> None:
