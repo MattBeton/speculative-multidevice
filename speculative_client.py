@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from model import MLXGenerationModel
+from mlx_model import MLXGenerationModel
 from timing import TokenTimer
 from shared import (
     MessageChannel,
@@ -20,13 +20,15 @@ from shared import (
     run_mlx,
 )
 
+from const import SPEC_K, MAX_NEW_TOKENS
+
 # ---- Configure the draft (client) model ----
 DRAFT_MODEL_PATH = next(Path(
-    "/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/"
-).glob("*"))
+    "~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/"
+).expanduser().glob("*"))
 
 # Fixed prompts list
-PROMPTS: List[str] = [
+PROMPTS: list[str] = [
     "Why is the sky blue?",
     "Explain speculative decoding in simple terms.",
     "Write a sonnet about the iPhone.",
@@ -37,88 +39,57 @@ PROMPTS: List[str] = [
     "Explain the theory of relativity.",
 ]
 
-SPEC_K = 8
-MAX_NEW_TOKENS = 64
-
 
 def _print_phase_summary(name: str, tokens: int, seconds: float) -> None:
     tokps = (tokens / seconds) if seconds > 0 else float("inf")
     print(f"[{name:7}] {tokens} toks in {seconds:.3f}s  → {tokps:.1f} tok/s")
 
 
-class StreamDraft:
-    """Holds per-stream local state for the draft model."""
-    def __init__(self, model_path: Path):
-        self.model = MLXGenerationModel(model_path)
-        self.eos = self.model.eos_token_id()
-        self.ids: Optional[np.ndarray] = None   # tokenized full prompt
-
-        self.generated: List[int] = []
-        self.last_token: Optional[int] = None   # last committed token for next round
-        self.finished: bool = False
-
-    async def tokenize(self, text: str) -> None:
-        ids = await run_mlx(self.model.tokenize, text)
-        self.ids = np.array(ids, dtype=np.int32)
-
-    async def prefill_local(self) -> None:
-        """Prefill draft KV with all but last prompt token."""
-        if self.ids is None or len(self.ids) < 1:
-            raise RuntimeError("empty tokenized prompt")
-        prefix = self.ids[:-1]
-        await run_mlx(self.model.forward, prefix, False)
-        self.last_token = int(self.ids[-1])
-
-    def token_budget_used(self) -> int:
-        return len(self.ids) - 1 if self.ids is not None else 0
-
-    def decoded_text(self) -> str:
-        return self.model.decode(self.generated)
-
-
-class BatchDraftClient:
+class DraftClient:
     """Client for batched speculative decoding with fixed batch size."""
-    def __init__(self, channel: MessageChannel, prompts: List[str]):
+    def __init__(self, channel: MessageChannel, prompts: list[str]):
         self._channel = channel
         self._prompts = prompts
-        self._streams: List[StreamDraft] = [
-            StreamDraft(DRAFT_MODEL_PATH) for _ in prompts
-        ]
+        self.model = MLXGenerationModel(DRAFT_MODEL_PATH)
+        self.last: list[int] = None
 
     async def reset_remote(self) -> None:
         """Send reset request to server and wait for acknowledgment."""
         await self._channel.send(ResetRequest())
         resp = await self._channel.recv()
-        if not isinstance(resp, ResetResponse):
-            raise RuntimeError(f"expected ResetResponse, got {type(resp)!r}")
+        assert isinstance(resp, ResetResponse)
 
     async def prefill_both(self, timer: TokenTimer) -> None:
         """Tokenize + prefill locally; send prefill request remotely."""
-        # 1) Tokenize all streams
-        await asyncio.gather(*(
-            stream.tokenize(prompt)
-            for stream, prompt in zip(self._streams, self._prompts)
-        ))
+        prompts: list[list[int]] = [
+            await run_mlx(self.model.tokenize, prompt)
+            for prompt in self._prompts
+        ]
 
-        prompts: List[List[int]] = []
-        for stream in self._streams:
-            prompts.append(stream.ids.astype(int).tolist())
+        tokens = [prompt[:-1] for prompt in prompts]
+        self.last = [prompt[-1] for prompt in prompts]
 
-        with timer.measure("prefill", lambda: sum(len(st.ids) - 1 for st in self._streams)):
-            # TODO: Put this as a single prefil, do both simultaneously.
-            await asyncio.gather(*(
-                stream.prefill_local()
-                for stream in self._streams
-            ))
+        with timer.measure("prefill", lambda: sum(len(prompt) - 1 for prompt in prompts)):
+            prefill_local = asyncio.create_task(
+                run_mlx(self.model.prefill, tokens)
+            )
 
-            await self._channel.send(PrefillRequest(prompts=prompts))
-            msg = await self._channel.recv()
-            if not isinstance(msg, PrefillResponse):
-                raise RuntimeError(f"expected PrefillResponse, got {type(msg)!r}")
+            async def send_and_recv():
+                await self._channel.send(PrefillRequest(prompts=tokens))
+                return await self._channel.recv()
+
+            prefill_remote = asyncio.create_task(send_and_recv())
+
+            await asyncio.gather(prefill_local, prefill_remote)
+
+        prefill = timer.get('prefill')
+        _print_phase_summary("prefill", prefill.tokens, prefill.seconds)
+
 
     async def decode_batch(self, spec_k: int, max_new_tokens: int, timer: TokenTimer) -> List[str]:
         """Drive speculative decode for all streams until each finishes or budget hit."""
         def _total_committed() -> int:
+            return 100
             return sum(len(st.generated) for st in self._streams)
 
         # Timing accumulators for decode phase
@@ -129,10 +100,6 @@ class BatchDraftClient:
             round_count = 0
             max_rounds = 5
             while True:
-                # Check if all streams are finished
-                if all(st.finished for st in self._streams):
-                    break
-                
                 # Limit to 5 rounds of drafting
                 if round_count >= max_rounds:
                     break
@@ -146,45 +113,30 @@ class BatchDraftClient:
 
                 # 1) Generate draft tokens for each stream (client work)
                 client_start = time.perf_counter()
-                for stream in self._streams:
-                    # For finished streams, add empty drafts
-                    if stream.finished or len(stream.generated) >= max_new_tokens:
-                        stream.finished = True
-                        # Add placeholder empty draft for this stream
-                        draft_toks_batch.append([])
-                        draft_topk_idx_batch.append([])
-                        draft_topk_vals_batch.append([])
-                        continue
 
-                    # Draft up to K tokens autoregressively
-                    draft_toks: List[int] = []
-                    draft_topk_idx: List[List[int]] = []
-                    draft_topk_vals: List[List[float]] = []
+                current = self.last
+                for _ in range(spec_k):
+                    y = np.array([current], dtype=np.int32).reshape(-1, 1)
+                    print(y.shape)
+                    tok, s_topk_idx, s_topk_vals = await run_mlx(self.model.forward, y, only_final=False)
 
-                    cur = stream.last_token
-                    for _ in range(spec_k):
-                        y = np.array([[int(cur)]], dtype=np.int32)
-                        tok, topk_idx, topk_vals = await run_mlx(stream.model.forward, y)
+                    draft_toks_batch.append(tok.tolist())
+                    draft_topk_idx_batch.append(s_topk_idx.tolist())
+                    draft_topk_vals_batch.append(s_topk_vals.tolist())
 
-                        t = int(tok[-1])
-                        draft_toks.append(t)
-                        # Convert numpy arrays to lists
-                        draft_topk_idx.append(topk_idx[-1].astype(int).tolist())
-                        draft_topk_vals.append([float(v) for v in topk_vals[-1]])
-                        cur = t
+                    current = tok
 
-                    # Add to batch
-                    draft_toks_batch.append(draft_toks)
-                    draft_topk_idx_batch.append(draft_topk_idx)
-                    draft_topk_vals_batch.append(draft_topk_vals)
+                    ## TODO: These are currently getting appended as (S, B, K) not (B, S, K)
+
+
+                ### TMP
+                for b in range(3):
+                    print(self.model.decode(self.model.tokens[b, :]))
+                raise Exception('stop')
 
                 # Pause client timing before server wait
                 client_time_before_server = time.perf_counter() - client_start
                 total_client_time += client_time_before_server
-
-                # If no active streams, break
-                if all(len(toks) == 0 for toks in draft_toks_batch):
-                    break
 
                 # 2) Send batch verify request and wait for response (server wait)
                 verify_req = VerifyRequest(
@@ -200,11 +152,14 @@ class BatchDraftClient:
                 server_wait_time = server_wait_end - server_wait_start
                 total_server_wait_time += server_wait_time
 
-                if not isinstance(resp, VerifyResponse):
-                    raise RuntimeError(f"expected VerifyResponse, got {type(resp)!r}")
+                assert isinstance(resp, VerifyResponse)
 
-                # 3) Apply results per stream (client work)
                 client_start = time.perf_counter()
+
+
+
+
+
                 for i, stream in enumerate(self._streams):
                     # Skip finished streams
                     if stream.finished:
@@ -264,7 +219,7 @@ async def main(host: str = 'localhost') -> None:
     # Connect to server
     reader, writer = await asyncio.open_connection(host, 7070)
     channel = MessageChannel(reader, writer)
-    client = BatchDraftClient(channel, PROMPTS)
+    client = DraftClient(channel, PROMPTS)
 
     timer = TokenTimer()
     try:

@@ -7,13 +7,16 @@ BASE_MODEL = os.environ.get("HF_BASE_MODEL", "meta-llama/Llama-3.2-3B-Instruct")
 TOP_K = int(os.environ.get("HF_TOP_K", "20"))
 ATTN_IMPL_ENV = os.environ.get("HF_ATTN_IMPL", "").strip()  # e.g., "flash_attention_2" if available
 
+# speculative decoding config
+SPEC_K = 8
+MAX_NEW_TOKENS = 64
+
 # Server configuration
 HOST = os.environ.get("HF_SPEC_HOST", "0.0.0.0")
 PORT = int(os.environ.get("HF_SPEC_PORT", "7070"))
 
 # Random seed
 SEED = 90
-TOP_K = 20
 
 # Device and dtype configuration
 if torch.cuda.is_available():
