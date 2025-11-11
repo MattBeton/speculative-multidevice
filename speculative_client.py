@@ -3,7 +3,8 @@ import argparse
 import asyncio
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, List
+import copy
 
 import numpy as np
 
@@ -86,15 +87,12 @@ class DraftClient:
 
             await asyncio.gather(prefill_local, prefill_remote)
 
-        prefill = timer.get('prefill')
-        _print_phase_summary("prefill", prefill.tokens, prefill.seconds)
-
 
     async def decode_batch(self, spec_k: int, max_new_tokens: int, timer: TokenTimer) -> List[str]:
         """Drive speculative decode for all streams until each finishes or budget hit."""
+        initial_lengths = copy.deepcopy(self.model.lengths)
         def _total_committed() -> int:
-            return 100
-            return sum(len(st.generated) for st in self._streams)
+            return sum(self.model.lengths[i] - initial_lengths[i] for i in range(self.batch_size))
 
         # Timing accumulators for decode phase
         total_client_time = 0.0
@@ -121,7 +119,7 @@ class DraftClient:
                 current = self.last
                 for _ in range(spec_k):
                     y = np.array([current], dtype=np.int32).reshape(-1, 1)
-                    print(y.shape)
+                    # print(y.shape)
                     tok, s_topk_idx, s_topk_vals = await run_mlx(self.model.forward, y, only_final=False)  # tok: (B, 1), topk: (B, 1, K)
 
                     for b in range(self.batch_size):  # Append per-batch-item to maintain (B, S, K) structure
@@ -137,9 +135,9 @@ class DraftClient:
                 #     print(self.model.decode(self.model.tokens[b, :]))
                 # raise Exception('stop')
                 
-                print(np.array(draft_toks_batch).shape)
-                print(np.array(draft_topk_idx_batch).shape)
-                print(np.array(draft_topk_vals_batch).shape)
+                # print(np.array(draft_toks_batch).shape)
+                # print(np.array(draft_topk_idx_batch).shape)
+                # print(np.array(draft_topk_vals_batch).shape)
 
                 # Pause client timing before server wait
                 client_time_before_server = time.perf_counter() - client_start
@@ -178,11 +176,11 @@ class DraftClient:
         self._decode_client_time = total_client_time
         self._decode_server_wait_time = total_server_wait_time
 
-        for b in range(self.batch_size):
-            print(self.model.decode(self.model.tokens[b, :]))
+        # for b in range(self.batch_size):
+        #     print(self.model.decode(self.model.tokens[b, :]))
 
         # Decode final texts
-        return [stream.decoded_text() for stream in self._streams]
+        return [self.model.decode(self.model.tokens[i, :]) for i in range(self.batch_size)]
 
 
 async def main(host: str = 'localhost') -> None:
