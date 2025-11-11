@@ -68,7 +68,7 @@ class GenerationModel(ABC):
         """
 
     @abstractmethod
-    def prefill(self, tokens: list[list[int]]) -> np.ndarray:
+    def prefill(self, tokens: list[list[int]]) -> None:
         """Prefill the model's KV cache with the given tokens."""
 
     @abstractmethod
@@ -86,11 +86,11 @@ class GenerationModel(ABC):
 
     @property
     @abstractmethod
-    def eos_token_id(self) -> int | None:
+    def eos_token_id(self) -> int:
         """EOS token id or None."""
 
     @property
     @abstractmethod
-    def pad_id(self) -> int | None:
+    def pad_id(self) -> int:
         """Pad token id or None."""
 

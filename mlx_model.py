@@ -1,18 +1,18 @@
 from pathlib import Path
 import numpy as np
 
-from typing import final
+from typing import final, Any, override
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import load_tokenizer
 from mlx_lm.utils import load_model
-from mlx_lm.models.cache import BatchKVCache, make_prompt_cache
+from mlx_lm.models.cache import BatchKVCache
 
 from const import SEED, TOP_K
 from model import GenerationModel
 
 
-def topk_sample_mlx(logits, k: int):
+def topk_sample_mlx(logits: Any, k: int) -> tuple[Any, Any, Any]:
     """
     Top-k sampling in MLX without boolean indexing.
 
@@ -57,16 +57,17 @@ class MLXGenerationModel(GenerationModel):
 
         # self.cache = make_prompt_cache(self.model)  # rotating kv cache is fine
         self.cache: None | list[BatchKVCache] = None
-        self.tokens: np.ndarray | None = None          # shape = (B, S)
+        self.tokens: np.ndarray[Any, np.dtype[np.int32]] | None = None          # shape = (B, S)
         self.lengths: list[int] | None = None        # valid (non-pad) length per row
 
+    @override
     def reset(self) -> None:
         """Reset KV cache and local tracking."""
         self.cache = None
         self.tokens = None
         self.lengths = None
 
-    def _add_tokens(self, tokens: np.ndarray):
+    def _add_tokens(self, tokens: np.ndarray[Any, Any]) -> None:
         """
         Track the 'committed' token matrix for the batch, keeping per-row lengths.
         """
@@ -80,12 +81,13 @@ class MLXGenerationModel(GenerationModel):
         self.tokens = np.concatenate([self.tokens, t], axis=1)
         self.lengths = [L + t.shape[1] for L in self.lengths]
 
+    @override
     def forward(
             self, 
             tokens: np.ndarray, 
             add_tokens=True, 
             only_final=True
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray[Any, np.dtype[np.int32]], np.ndarray[Any, np.dtype[np.int32]], np.ndarray[Any, np.dtype[np.float32]]]:
         if add_tokens:
             self._add_tokens(tokens)
 
@@ -105,7 +107,8 @@ class MLXGenerationModel(GenerationModel):
             np.asarray(topk_vals.astype(mx.float32)),
         )
 
-    def prefill(self, tokens: list[list[int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    @override
+    def prefill(self, tokens: list[list[int]]) -> None:
         self.reset()
 
         self.lengths = [len(prompt) for prompt in tokens]
@@ -121,8 +124,9 @@ class MLXGenerationModel(GenerationModel):
         for i, prompt in enumerate(tokens):
             self.tokens[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
 
-        return self.forward(self.tokens, add_tokens=False)
+        self.forward(self.tokens, only_final=True)
 
+    @override
     def rollback_tokens(self, r: list[int]) -> None:
         """
         Per-row rollback for MLX caches that pre-allocate capacity.
@@ -194,19 +198,23 @@ class MLXGenerationModel(GenerationModel):
             toks_new[i, rhs_start:rhs_end] = self.tokens[i, lhs_start:lhs_end]
         self.tokens = toks_new
 
-    def tokenize(self, prompt: str) -> np.ndarray:
+    @override
+    def tokenize(self, prompt: str) -> np.ndarray[Any, np.dtype[np.int32]]:
         return np.asarray(self.tok.apply_chat_template(
             [{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=True
         ))
 
+    @override
     def decode(self, generated: list[int]) -> str:
         return self.tok.decode(generated)
 
     @property
+    @override
     def eos_token_id(self) -> int:
         return getattr(self.tok, "eos_token_id", 0)
 
     @property
+    @override
     def pad_id(self) -> int:
         pad_id = getattr(self.tok, "pad_token_id", None)
         if pad_id is None:
