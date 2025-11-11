@@ -128,6 +128,10 @@ class DraftClient:
 
                     current = tok[:, 0].tolist()
 
+                # Commit the last drafted token (t_{K-1}) so all K drafts are present locally.
+                # This avoids the m==K corner case without any base-token forwards.
+                y_last = np.array([current], dtype=np.int32).reshape(-1, 1)
+                await run_mlx(self.model.forward, y_last, only_final=False)
 
                 # ### TMP
                 # for b in range(3):
@@ -160,16 +164,18 @@ class DraftClient:
 
                 client_start = time.perf_counter()
 
-                await run_mlx(
-                    self.model.rollback_tokens, 
-                    [SPEC_K - r for r in resp.accepted_len]
-                )
+                # Roll back the unaccepted drafted tokens (base is still deferred).
+                await run_mlx(self.model.rollback_tokens, [spec_k - r for r in resp.accepted_len])
+
+                # Seed next round; never propagate -1 (EOS sentinel).
+                self.last = [
+                    (resp.base_token[i] if resp.base_token[i] >= 0 else self.last[i])
+                    for i in range(self.batch_size)
+                ]
 
                 # Accumulate remaining client time for this round
                 client_end = time.perf_counter()
                 total_client_time += client_end - client_start
-
-                self.last = resp.base_token
 
         # Store timing values for reporting
         self._decode_client_time = total_client_time
