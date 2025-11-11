@@ -185,13 +185,8 @@ class MLXGenerationModel(GenerationModel):
             self.add_tokens(tokens)
 
         tokens_mlx = mx.array(tokens, dtype=mx.int32)
-        
-        kwargs = {"cache":self.cache}
-        # mask, pos = self._prefill_mask_and_positions(tokens)
-        # kwargs['mask'] = mask
-        # kwargs['cache_position'] = pos
 
-        logits = self.model(tokens_mlx, **kwargs)  # (B, T, V)
+        logits = self.model(tokens_mlx, cache=self.cache)  # (B, T, V)
 
         if only_final:
             logits = logits[:, -1, :]  # -> (B, V)
@@ -220,18 +215,6 @@ class MLXGenerationModel(GenerationModel):
             self.tokens[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
 
         return self.forward(self.tokens, add_tokens=False)
-
-    # def prefill(self, tokens: list[list[int]]) -> np.array:
-    #     self.lengths = [len(prompt) for prompt in tokens]
-    #     self.tokens = tokens
-    #
-    #     # Pad before prefill
-    #     S = max(self.lengths)
-    #     tokens_np = np.full((len(tokens), S), 0, dtype=np.int32)
-    #     for i, prompt in enumerate(tokens):
-    #         tokens_np[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
-    #
-    #     return self.forward(tokens_np, add_tokens=False)
 
     def rollback_tokens(self, r: list[int]) -> None:
         """
@@ -279,22 +262,11 @@ class MLXGenerationModel(GenerationModel):
                 K_src = K[i, :, lhs_start:lhs_end, :]
                 V_src = V[i, :, lhs_start:lhs_end, :]
 
-                # print(K_src[0, :, 0])
-
                 rhs_start = S_target - keep
                 rhs_end = S_target
 
-                # print(S_prev, L_prev[i], r[i])
-
-                # if i == 0:
-                #     print(lhs_start, lhs_end)
-                #     print(rhs_start, rhs_end)
-
                 K_new[i, :, rhs_start:rhs_end, :] = K_src
                 V_new[i, :, rhs_start:rhs_end, :] = V_src
-
-                # print(np.array(K_new[0, 0, :, 0].tolist()))
-                # raise Exception('stop')
 
             new_left_pad = mx.array([S_target - k for k in L_new], dtype=mx.int32)  # per-row
             new_offset   = mx.array(L_new, dtype=mx.int32)                          # per-row
@@ -311,10 +283,6 @@ class MLXGenerationModel(GenerationModel):
 
             rhs_start = S_target - L_new[i]
             rhs_end = S_target
-
-            # if i == 0:
-            #     print(lhs_start, lhs_end)
-            #     print(rhs_start, rhs_end)
 
             toks_new[i, rhs_start:rhs_end] = self.tokens[i, lhs_start:lhs_end]
         self.tokens = toks_new
