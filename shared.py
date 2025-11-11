@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import asyncio
-import typing as _t
 import functools
 import json
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional, Type, Union, List
+from typing import Dict, Optional, Type, Union
 
 # Try to use orjson for faster JSON serialization
 try:
@@ -24,7 +23,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     _np = None
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict
 
 # ---------- MLX single-thread executor ----------
 # All MLX work runs on this single thread to avoid thread-safety gotchas.

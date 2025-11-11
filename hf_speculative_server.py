@@ -24,10 +24,8 @@ from const import (
     SEED,
     DEVICE,
     DTYPE,
-    TOP_K,
     ATTN_IMPL_ENV,
     GENERATOR,
-    PY_RNG,
     HF_TOKEN,
 )
 
@@ -112,13 +110,6 @@ class BatchVerifier:
         t0 = time.perf_counter()
         outputs = self.model(input_ids=x, use_cache=True, past_key_values=self.cache)
 
-        # DEBUG: Print KV cache strip from layer 10 (for shorter prompt in batch)
-        # Find the shorter prompt (smaller len in self.lens)
-        if len(self.lens) > 1:
-            shorter_idx = min(range(len(self.lens)), key=lambda i: self.lens[i])
-        else:
-            shorter_idx = 0
-        
         if DEVICE.type == "cuda":
             torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -127,13 +118,6 @@ class BatchVerifier:
         # 2) accept + choose fallback (no global top-k)
         t2 = time.perf_counter()
         logits = outputs.logits  # (B, K+1, V)
-        
-        # DEBUG: Print topk logits for each token in verify step (for shorter prompt in batch)
-        # Find the shorter prompt (smaller len in self.lens)
-        if len(self.lens) > 1:
-            shorter_idx = min(range(len(self.lens)), key=lambda i: self.lens[i])
-        else:
-            shorter_idx = 0
         
         accepted, base_tok, hit_eos = self._accept_and_choose(
             logits, draft_toks, draft_topk_idx, draft_topk_vals
@@ -271,8 +255,6 @@ class BatchVerifier:
         assert cache.layers[0].keys is not None and cache.layers[0].values is not None
         B = len(draft_tokens)
 
-        print(f'{rollback=}')
-
         L_prev = [x + len(draft_tokens[0]) + 1 for x in self.lens]
         L_new  = [L_prev[i] - rollback[i] for i in range(B)]
 
@@ -302,7 +284,7 @@ class BatchVerifier:
                 K_src = K[i, :, lhs_start:lhs_end, :]
                 V_src = V[i, :, lhs_start:lhs_end, :]
 
-                start = S_target - L_new[i]
+                start = S_target - keep
 
                 K_new[i, :, start:, :] = K_src
                 V_new[i, :, start:, :] = V_src
@@ -350,7 +332,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             avg_fwd = verifier.total_forward_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
             avg_post = verifier.total_post_model_time / verifier.verify_iterations if verifier.verify_iterations else 0.0
             combined_tps = verifier.total_positions_verified / total_time if total_time > 0 else 0.0
-            print(f"\n[BATCH SERVER TIMING SUMMARY]")
+            print("\n[BATCH SERVER TIMING SUMMARY]")
             print(f"  Total verify iterations: {verifier.verify_iterations}")
             print(f"  Total positions verified: {verifier.total_positions_verified}")
             print(f"  Total tokens processed:  {verifier.total_tokens_processed}")

@@ -13,6 +13,7 @@ PORT = int(os.environ.get("HF_SPEC_PORT", "7070"))
 
 # Random seed
 SEED = 90
+TOP_K = 20
 
 # Device and dtype configuration
 if torch.cuda.is_available():

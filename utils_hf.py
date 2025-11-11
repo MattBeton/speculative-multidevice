@@ -1,6 +1,5 @@
 from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import os
 import torch
 import torch.nn as nn
 from transformers import DynamicCache

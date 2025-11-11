@@ -14,7 +14,7 @@ Works with the MessageChannel API defined in shared.py (PrefillRequest/VerifyReq
 import argparse
 import asyncio
 import time
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 from transformers import AutoTokenizer  # only to read vocab size / special ids
@@ -213,7 +213,7 @@ def main():
     ap.add_argument("--port", type=int, default=7070)
     ap.add_argument("--tokenizer", default="meta-llama/Llama-3.2-3B-Instruct")
     ap.add_argument("-b", "--batch", type=int, default=8)
-    ap.add_argument("-n", "--prefill-len", type=int, default=200)
+    ap.add_argument("-n", "--prefill-len", type=int, default=16)
     ap.add_argument("-k", "--k-verify", type=int, default=8)
     ap.add_argument("-r", "--rounds", type=int, default=5)
     ap.add_argument("-w", "--warmup", type=int, default=3)
