@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 import mlx.core as mx
 
-from model import MLXGenerationModel
+from mlx_model import MLXGenerationModel
 
 # ---- Draft/base config for local MLX model ----
 DRAFT_MODEL_PATH = next(
@@ -54,7 +54,7 @@ def print_kv(model: MLXGenerationModel):
 
 def main():
     model = MLXGenerationModel(DRAFT_MODEL_PATH)
-    pad_id = model.pad_id()
+    pad_id = model.pad_id
 
     # --- Tokenize and split into prefix (all but last) + last prompt token
     ids_list = [list(model.tokenize(p)) for p in PROMPTS]
@@ -97,6 +97,7 @@ def main():
     # After rollback, compute per-row 'last' token to feed the next step
     # last_after = last_nonpad_token_ids(model.tokens, pad_id).reshape(B, 1)
     last_after = model.tokens[:, -1].reshape(B, 1)
+    model.rollback_tokens([1 for _ in range(B)])
 
     # ---- Continue generating N_GEN_AFTER tokens ----
     generated_after: list[list[int]] = [[] for _ in range(B)]
