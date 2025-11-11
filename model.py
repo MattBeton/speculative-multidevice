@@ -184,8 +184,13 @@ class MLXGenerationModel(GenerationModel):
             self.add_tokens(tokens)
 
         tokens_mlx = mx.array(tokens, dtype=mx.int32)
-        print(tokens_mlx.shape)
-        logits = self.model(tokens_mlx, cache=self.cache)  # (B, T, V)
+        
+        kwargs = {"cache":self.cache}
+        # mask, pos = self._prefill_mask_and_positions(tokens)
+        # kwargs['mask'] = mask
+        # kwargs['cache_position'] = pos
+
+        logits = self.model(tokens_mlx, **kwargs)  # (B, T, V)
 
         if only_final:
             logits = logits[:, -1, :]  # -> (B, V)
@@ -210,6 +215,18 @@ class MLXGenerationModel(GenerationModel):
 
         return self.forward(self.tokens, add_tokens=False)
 
+    # def prefill(self, tokens: list[list[int]]) -> np.array:
+    #     self.lengths = [len(prompt) for prompt in tokens]
+    #     self.tokens = tokens
+    #
+    #     # Pad before prefill
+    #     S = max(self.lengths)
+    #     tokens_np = np.full((len(tokens), S), 0, dtype=np.int32)
+    #     for i, prompt in enumerate(tokens):
+    #         tokens_np[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
+    #
+    #     return self.forward(tokens_np, add_tokens=False)
+
     def rollback_tokens(self, r: list[int]) -> None:
         """
         Per-row rollback for MLX caches that pre-allocate capacity.
@@ -231,13 +248,16 @@ class MLXGenerationModel(GenerationModel):
         S_prev = max(L_prev)
         S_target = max(L_new)
 
+        B = len(r)
+
         # 3) Repack each layer's K/V into the same capacity, right-aligned
         for c in self.cache:
+            print(type(c))
             K = c.keys   # (B, H, S_cap, D)
             V = c.values
             assert K is not None and V is not None
 
-            B, H, S_cap, D = K.shape
+            _, H, S_cap, D = K.shape
 
             # fresh arrays with identical capacity
             K_new = mx.zeros((B, H, S_cap, D), dtype=K.dtype)
@@ -260,47 +280,39 @@ class MLXGenerationModel(GenerationModel):
                 rhs_end = S_target
 
                 # print(S_prev, L_prev[i], r[i])
-                #
-                # print(lhs_start, lhs_end)
-                # print(rhs_start, rhs_end)
+
+                # if i == 0:
+                #     print(lhs_start, lhs_end)
+                #     print(rhs_start, rhs_end)
 
                 K_new[i, :, rhs_start:rhs_end, :] = K_src
                 V_new[i, :, rhs_start:rhs_end, :] = V_src
 
                 # print(np.array(K_new[0, 0, :, 0].tolist()))
-                
                 # raise Exception('stop')
 
             # Install rebuilt tensors back into this layer
             c.keys = K_new
             c.values = V_new
-
-            # If the cache object tracks per-row lengths, update it.
-            # (Recent mlx-lm versions expose `lengths`; older ones may not.)
-            if hasattr(c, "lengths"):
-                try:
-                    c.lengths = mx.array(L_new, dtype=mx.int32)
-                except Exception:
-                    pass
+            c.offset = S_target
 
         # 4) Keep our own bookkeeping in sync
         self.lengths = L_new
-        if self.tokens is not None:
-            if self.tokens.ndim == 1:
-                self.tokens = self.tokens[:L_new[0]]
-            elif self.tokens.ndim == 2:
-                # Rebuild a left-padded token matrix to a uniform width = max(L_new)
-                S_tgt = max(L_new) if L_new else 0
-                pad = self._pad_id if self._pad_id is not None else 0
-                toks_new = np.full((B, S_tgt), pad, dtype=np.int32)
-                for i in range(B):
-                    k_i = L_new[i]
-                    if k_i > 0:
-                        toks_new[i, S_tgt - k_i:] = self.tokens[i, :k_i]
-                self.tokens = toks_new
-            else:
-                # Unknown shape — drop it instead of risking inconsistency.
-                self.tokens = None
+
+        toks_new = np.full((B, S_target), self._pad_id, dtype=np.int32)
+        for i in range(len(r)):
+            lhs_start = S_prev - L_prev[i]
+            lhs_end = lhs_start + L_new[i]
+
+            rhs_start = S_target - L_new[i]
+            rhs_end = S_target
+
+            # if i == 0:
+            #     print(lhs_start, lhs_end)
+            #     print(rhs_start, rhs_end)
+
+            toks_new[i, rhs_start:rhs_end] = self.tokens[i, lhs_start:lhs_end]
+        self.tokens = toks_new
 
     def tokenize(self, prompt: str) -> np.array:
         return np.array(self.tok.apply_chat_template(
@@ -316,11 +328,8 @@ class MLXGenerationModel(GenerationModel):
     def pad_id(self) -> int | None:
         pid = getattr(self.tok, "pad_token_id", None)
         if pid is None:
-            # fall back like utils_hf.get_pad_id: prefer eos, else 0
-            pid = getattr(self.tok, "eos_token_id", None)
-            if pid is None:
-                pid = 0
-        return int(pid)
+            pid = 0
+        return pid
 
 
 

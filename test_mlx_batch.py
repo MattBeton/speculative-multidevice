@@ -13,13 +13,13 @@ DRAFT_MODEL_PATH = next(
 
 PROMPTS = [
     "Why is the sky blue?",
-    "Explain speculative decoding in simple terms.",
+    "Explain the theory of relativity.",
     "Write a sonnet about the iPhone.",
     "What are the benefits of renewable energy?",
     "Describe the process of photosynthesis.",
     "How does machine learning work?",
     "What is the difference between AI and AGI?",
-    "Explain the theory of relativity.",
+    "Explain speculative decoding in simple terms.",
 ]
 
 N_GEN_BEFORE = 10
@@ -43,18 +43,30 @@ def last_nonpad_token_ids(mat: np.ndarray, pad_id: int) -> np.ndarray:
 def decode_rows(model: MLXGenerationModel, rows_ids: list[list[int]]) -> list[str]:
     return [model.decode(ids) for ids in rows_ids]
 
+def print_kv(model: MLXGenerationModel):
+    print("\n=== KV cache slice ===")
+    if model.cache and len(model.cache) > 0:
+        cache_keys = model.cache[0].keys
+        if cache_keys is not None:
+            slice_val = cache_keys[0, 0, :, 0]
+            mx.eval(slice_val)
+            print(np.asarray(slice_val.astype(mx.float32)))
+
 def main():
     model = MLXGenerationModel(DRAFT_MODEL_PATH)
     pad_id = model.pad_id()
 
     # --- Tokenize and split into prefix (all but last) + last prompt token
     ids_list = [list(model.tokenize(p)) for p in PROMPTS]
-    prefixes = [ids[:-1] for ids in ids_list]
+    X = [ids[:-1] for ids in ids_list]
     last_tok  = [ids[-1] for ids in ids_list]  # (B,)
 
     # Prefill: only prefixes (left-padded batch)
-    X = left_pad_to_matrix(prefixes, pad_id)
-    _ = model.forward(X, only_final=False)  # fill KV; ignore the returned sample
+    _ = model.prefill(X)  # fill KV; ignore the returned sample
+
+    # cache_keys = model.cache[0].keys
+    # print('total non zero entries to kv:', (cache_keys[0, 0, :, 0] != 0).sum())
+    # print('alledged prompt length', model.lengths)
 
     # ---- Generate N_GEN_BEFORE tokens in batch ----
     B = len(PROMPTS)
@@ -70,17 +82,10 @@ def main():
 
     print("\n=== Before rollback (first 2 streams for brevity) ===")
     for i in range(min(2, B)):
-        txt = model.decode(generated_before[i])
+        txt = model.decode(model.tokens[i])
         print(f"[{i}] {txt}")
 
-    # Print KV cache slice before rollback
-    print("\n=== KV cache slice before rollback (batch idx=0, layer=0, head=0, dim=0) ===")
-    if model.cache and len(model.cache) > 0:
-        cache_keys = model.cache[0].keys
-        if cache_keys is not None:
-            slice_val = cache_keys[0, 0, :, 0]
-            mx.eval(slice_val)
-            print(np.asarray(slice_val.astype(mx.float32)))
+    print_kv(model)
 
     # ---- Per-row rollback by variable amounts (0..7 here; feel free to set up to 10) ----
     # Example rollback vector: [0,1,2,3,4,5,6,7]
@@ -88,14 +93,12 @@ def main():
     print(f"\nRollback vector per row: {r}")
     model.rollback_tokens(r)
 
-    # Print KV cache slice after rollback
-    print("\n=== KV cache slice after rollback (batch idx=0, layer=0, head=0, dim=0) ===")
-    if model.cache and len(model.cache) > 0:
-        cache_keys = model.cache[0].keys
-        if cache_keys is not None:
-            slice_val = cache_keys[0, 0, :, 0]
-            mx.eval(slice_val)
-            print(np.asarray(slice_val.astype(mx.float32)))
+    print("\n=== After rollback (first 2 streams for brevity) ===")
+    for i in range(min(2, B)):
+        txt = model.decode(model.tokens[i])
+        print(f"[{i}] {txt}")
+
+    print_kv(model)
 
     # After rollback, compute per-row 'last' token to feed the next step
     # last_after = last_nonpad_token_ids(model.tokens, pad_id).reshape(B, 1)
