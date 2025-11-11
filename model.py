@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import load_tokenizer
 from mlx_lm.utils import load_model
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import BatchKVCache
 
 SEED = 90
 TOP_K = 20
@@ -140,7 +140,8 @@ class MLXGenerationModel(GenerationModel):
         self.model, self.config = load_model(model_path)
         self.tok = load_tokenizer(model_path)
 
-        self.cache = make_prompt_cache(self.model)  # rotating kv cache is fine
+        # self.cache = make_prompt_cache(self.model)  # rotating kv cache is fine
+        self.cache: None | list[BatchedKVCache] = None
         self.tokens: np.array | None = None          # shape = (B, S)
         self.lengths: list[int] | None = None        # valid (non-pad) length per row
         self._pad_id = self.pad_id()                 # resolved once
@@ -207,6 +208,11 @@ class MLXGenerationModel(GenerationModel):
     def prefill(self, tokens: list[list[int]]) -> np.array:
         self.lengths = [len(prompt) for prompt in tokens]
 
+        n_layers = len(self.model.layers)
+        self.cache = [
+            BatchKVCache(left_padding=[max(self.lengths) - l for l in self.lengths]) for _ in range(n_layers)
+        ]
+
         # Pad before prefill
         S = max(self.lengths)
         self.tokens = np.full((len(tokens), S), 0, dtype=np.int32)
@@ -252,7 +258,6 @@ class MLXGenerationModel(GenerationModel):
 
         # 3) Repack each layer's K/V into the same capacity, right-aligned
         for c in self.cache:
-            print(type(c))
             K = c.keys   # (B, H, S_cap, D)
             V = c.values
             assert K is not None and V is not None
@@ -260,8 +265,8 @@ class MLXGenerationModel(GenerationModel):
             _, H, S_cap, D = K.shape
 
             # fresh arrays with identical capacity
-            K_new = mx.zeros((B, H, S_cap, D), dtype=K.dtype)
-            V_new = mx.zeros((B, H, S_cap, D), dtype=V.dtype)
+            K_new = mx.zeros((B, H, S_target, D), dtype=K.dtype)
+            V_new = mx.zeros((B, H, S_target, D), dtype=V.dtype)
 
             for i in range(len(r)):
                 keep = L_new[i]
@@ -291,10 +296,10 @@ class MLXGenerationModel(GenerationModel):
                 # print(np.array(K_new[0, 0, :, 0].tolist()))
                 # raise Exception('stop')
 
-            # Install rebuilt tensors back into this layer
-            c.keys = K_new
-            c.values = V_new
-            c.offset = S_target
+            new_left_pad = mx.array([S_target - k for k in L_new], dtype=mx.int32)  # per-row
+            new_offset   = mx.array(L_new, dtype=mx.int32)                          # per-row
+
+            c.state = (K_new, V_new, new_offset, new_left_pad)
 
         # 4) Keep our own bookkeeping in sync
         self.lengths = L_new

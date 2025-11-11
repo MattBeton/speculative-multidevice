@@ -72,6 +72,10 @@ def main():
     B = len(PROMPTS)
     generated_before: list[list[int]] = [[] for _ in range(B)]
 
+    # print('------- before')
+    # print(model.cache[0].state[2])
+    # print(model.cache[0].state[3])
+
     cur = np.asarray(last_tok, dtype=np.int32).reshape(B, 1)  # feed last prompt token
     for _ in range(N_GEN_BEFORE):
         toks, _, _ = model.forward(cur)                       # (B,)
@@ -85,11 +89,13 @@ def main():
         txt = model.decode(model.tokens[i])
         print(f"[{i}] {txt}")
 
-    print_kv(model)
+    # print_kv(model)
 
     # ---- Per-row rollback by variable amounts (0..7 here; feel free to set up to 10) ----
     # Example rollback vector: [0,1,2,3,4,5,6,7]
     r = [(i + 3) % 5 for i in range(B)]  # <= 10 as requested
+    # r = [N_GEN_BEFORE] + [0] * (B - 1)  # <= 10 as requested
+    # r = [N_GEN_BEFORE] * B  # <= 10 as requested
     print(f"\nRollback vector per row: {r}")
     model.rollback_tokens(r)
 
@@ -98,7 +104,11 @@ def main():
         txt = model.decode(model.tokens[i])
         print(f"[{i}] {txt}")
 
-    print_kv(model)
+    # print('------- after')
+    # print(model.cache[0].state[2])
+    # print(model.cache[0].state[3])
+
+    # print_kv(model)
 
     # After rollback, compute per-row 'last' token to feed the next step
     # last_after = last_nonpad_token_ids(model.tokens, pad_id).reshape(B, 1)
@@ -121,15 +131,15 @@ def main():
 
     # You can also inspect full resumed sequences by decoding:
     #  - the *entire* kept prefix + resumed tail:
-    kept_plus_after = []
-    for i in range(B):
-        # Reconstruct row i's kept prefix from model.tokens (drop pad)
-        row = [int(t) for t in model.tokens[i].tolist() if t != pad_id]
-        kept_plus_after.append(row + generated_after[i])
+    # kept_plus_after = []
+    # for i in range(B):
+    #     # Reconstruct row i's kept prefix from model.tokens (drop pad)
+    #     row = [int(t) for t in model.tokens[i].tolist() if t != pad_id]
+    #     kept_plus_after.append(row + generated_after[i])
 
-    print("\n=== Kept+Resumed (full rows; first 2 streams) ===")
-    for i in range(min(2, B)):
-        print(f"[{i}] {model.decode(kept_plus_after[i])}\n")
+    # print("\n=== Kept+Resumed (full rows; first 2 streams) ===")
+    # for i in range(min(2, B)):
+    #     print(f"[{i}] {model.decode(kept_plus_after[i])}\n")
 
 if __name__ == "__main__":
     main()
