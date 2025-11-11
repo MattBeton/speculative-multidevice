@@ -14,7 +14,6 @@ Works with the MessageChannel API defined in shared.py (PrefillRequest/VerifyReq
 import argparse
 import asyncio
 import time
-from typing import List
 
 import numpy as np
 from transformers import AutoTokenizer  # only to read vocab size / special ids
@@ -47,7 +46,7 @@ def _reserved_ids(tok) -> set:
     return res
 
 
-def _allowed_pool(tok, low_floor: int = 32) -> List[int]:
+def _allowed_pool(tok, low_floor: int = 32) -> list[int]:
     """Return a pool of 'normal' token ids to choose from (avoid control/specials)."""
     try:
         vocab_size = int(tok.vocab_size)
@@ -67,7 +66,7 @@ def _build_disjoint_prompts(
     n_tokens: int,
     header_len: int = 8,
     seed: int = 12345,
-) -> List[List[int]]:
+) -> list[list[int]]:
     """
     Create B prompts (each length N) such that no two prompts share any prefix.
     Guarantee: the first token of every stream is distinct ⇒ pairwise LCP = 0.
@@ -79,7 +78,7 @@ def _build_disjoint_prompts(
 
     # Pick B * header_len distinct header tokens with wide spacing
     # (wrap if pool smaller; uniqueness of position 0 is what enforces LCP=0).
-    prompts: List[List[int]] = []
+    prompts: list[list[int]] = []
     for i in range(batch_size):
         # header[0] is unique per stream (this alone enforces LCP=0)
         h0 = pool[i % len(pool)]
@@ -96,7 +95,7 @@ def _build_disjoint_prompts(
         prompts.append(header + tail)
 
     # Sanity: compute max LCP across pairs (should be 0)
-    def _lcp_len(a: List[int], b: List[int]) -> int:
+    def _lcp_len(a: list[int], b: list[int]) -> int:
         L = min(len(a), len(b))
         for t in range(L):
             if a[t] != b[t]:
@@ -112,7 +111,7 @@ def _build_disjoint_prompts(
     return prompts
 
 
-def _per_stream_verify_tokens(tok, batch_size: int) -> List[int]:
+def _per_stream_verify_tokens(tok, batch_size: int) -> list[int]:
     """Give each stream its own verify token id to avoid suffix coincidences."""
     pool = _allowed_pool(tok, low_floor=32)
     return [pool[(113 * i + 7) % len(pool)] for i in range(batch_size)]
@@ -154,9 +153,9 @@ async def run_bench(
     TOP_K_SIZE = 20
     for r in range(rounds + warmup):
         # Build batch arrays: draft_toks[i] is the draft tokens for stream i
-        draft_toks_batch: List[List[int]] = []
-        draft_topk_idx_batch: List[List[List[int]]] = []
-        draft_topk_vals_batch: List[List[List[float]]] = []
+        draft_toks_batch: list[list[int]] = []
+        draft_topk_idx_batch: list[list[list[int]]] = []
+        draft_topk_vals_batch: list[list[list[float]]] = []
 
         for i in range(batch_size):
             vt = vtok_per_stream[i]
@@ -164,8 +163,8 @@ async def run_bench(
             draft_toks_batch.append([vt] * k_verify)
             # Create dummy topk data: for each of K positions, provide a topk list
             # where the draft token is included (at position 0) so verification can proceed
-            stream_topk_idx: List[List[int]] = []
-            stream_topk_vals: List[List[float]] = []
+            stream_topk_idx: list[list[int]] = []
+            stream_topk_vals: list[list[float]] = []
             for _ in range(k_verify):
                 # Include the draft token itself as the first element
                 topk_idx = [vt] + [vt + j + 1 for j in range(TOP_K_SIZE - 1)]

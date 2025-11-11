@@ -1,7 +1,6 @@
 # hf_speculative_server.py
 import asyncio
 import time
-from typing import List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -42,11 +41,11 @@ class BatchVerifier:
         self.tok = tok
 
         self.cache: DynamicCache = DynamicCache()
-        self.last: List[int] = []
-        self.lens: List[int] = []  # committed per-stream lengths (prefix-only at prefill)
-        self.post_verify_task: Optional[asyncio.Task[None]] = None
+        self.last: list[int] = []
+        self.lens: list[int] = []  # committed per-stream lengths (prefix-only at prefill)
+        self.post_verify_task: asyncio.Task[None] | None = None
 
-        self.eos: Optional[int] = getattr(tok, "eos_token_id", None)
+        self.eos: int | None = getattr(tok, "eos_token_id", None)
 
         # timing
         self.verify_iterations = 0
@@ -69,7 +68,7 @@ class BatchVerifier:
         self.total_tokens_processed = 0
         self.total_positions_verified = 0
 
-    async def prefill_batch(self, prompts: List[List[int]]) -> None:
+    async def prefill_batch(self, prompts: list[list[int]]) -> None:
         # Store prefix lengths and last token per stream.
         self.lens = [len(p) - 1 for p in prompts]
         self.last = [int(p[-1]) for p in prompts]
@@ -81,9 +80,9 @@ class BatchVerifier:
     @torch.inference_mode()
     async def verify_batch(
         self,
-        draft_toks: List[List[int]],
-        draft_topk_vals: List[List[List[float]]],
-        draft_topk_idx: List[List[List[int]]],
+        draft_toks: list[list[int]],
+        draft_topk_vals: list[list[list[float]]],
+        draft_topk_idx: list[list[list[int]]],
     ) -> VerifyResponse:
         # Ensure previous commit finished before using self.cache again.
         if self.post_verify_task is not None and not self.post_verify_task.done():
@@ -152,12 +151,12 @@ class BatchVerifier:
     def _accept_and_choose(
         self,
         logits: torch.Tensor,                            # (B, K+1, V)
-        draft_toks: List[List[int]],
-        d_idx: List[List[List[int]]],                    # (B, K, k) as lists
-        d_val: List[List[List[float]]],                  # (B, K, k) as lists
+        draft_toks: list[list[int]],
+        d_idx: list[list[list[int]]],                    # (B, K, k) as lists
+        d_val: list[list[list[float]]],                  # (B, K, k) as lists
         sample_mode: str = "argmax",                     # "argmax" (fast) or "topk"
         sample_topk: int = 20,                            # used only if sample_mode == "topk"
-    ) -> Tuple[List[int], List[int], List[bool]]:
+    ) -> tuple[list[int], list[int], list[bool]]:
         B, KP1, V = logits.shape
         K = KP1 - 1
         device = logits.device

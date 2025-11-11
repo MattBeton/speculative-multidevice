@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from transformers import PreTrainedTokenizer
@@ -43,10 +42,10 @@ def _normalize_from_logprobs(logps: np.ndarray) -> np.ndarray:
 
 
 def _draft_lp_from_row(
-    d_ids: List[int],
-    d_vals: List[float],
+    d_ids: list[int],
+    d_vals: list[float],
     tok_id: int,
-) -> Tuple[float, int]:
+) -> tuple[float, int]:
     if not d_ids:
         return float("-inf"), -1
     try:
@@ -61,7 +60,7 @@ def _draft_lp_from_row(
     return float(lp_row[j]), j
 
 
-def _sample_from_lp_dict(lp_dict: Dict[int, object], rng: np.random.Generator) -> int:
+def _sample_from_lp_dict(lp_dict: dict[int, object], rng: np.random.Generator) -> int:
     items = [(int(t), float(o.logprob)) for t, o in lp_dict.items()]
     items.sort(key=lambda kv: kv[1], reverse=True)
     ids = np.array([t for t, _ in items], dtype=np.int64)
@@ -71,7 +70,7 @@ def _sample_from_lp_dict(lp_dict: Dict[int, object], rng: np.random.Generator) -
     return int(ids[idx])
 
 
-def _extract_prompt_rows(req_out, k: int) -> List[Optional[Dict[int, object]]]:
+def _extract_prompt_rows(req_out, k: int) -> list[dict[int, object] | None]:
     prompt_rows = getattr(req_out, "prompt_logprobs", None)
     if prompt_rows is None:
         if req_out.outputs:
@@ -84,10 +83,10 @@ def _extract_prompt_rows(req_out, k: int) -> List[Optional[Dict[int, object]]]:
 # ----------------- Multi-Stream Verifier -------------------
 class _StreamState:
     __slots__ = ("prefix", "last", "eos")
-    def __init__(self, eos: Optional[int]):
-        self.prefix: List[int] = []
-        self.last: Optional[int] = None
-        self.eos: Optional[int] = eos
+    def __init__(self, eos: int | None):
+        self.prefix: list[int] = []
+        self.last: int | None = None
+        self.eos: int | None = eos
 
 
 class Verifier:
@@ -98,7 +97,7 @@ class Verifier:
     def __init__(self, llm: LLM, tok: PreTrainedTokenizer):
         self.llm = llm
         self.tok = tok
-        self._states: Dict[str, _StreamState] = {}
+        self._states: dict[str, _StreamState] = {}
         self._rng = np.random.default_rng(SEED)
         self._default_id = "_default"
 
@@ -112,7 +111,7 @@ class Verifier:
     async def reset(self) -> None:
         self._states.clear()
 
-    async def prefill_single(self, prompt: List[int], sid: Optional[str] = None) -> None:
+    async def prefill_single(self, prompt: list[int], sid: str | None = None) -> None:
         if not prompt:
             raise ValueError("empty prompt")
         sid = sid or self._default_id
@@ -120,27 +119,27 @@ class Verifier:
         st.prefix = [int(x) for x in prompt[:-1]]
         st.last = int(prompt[-1])
 
-    async def prefill_batch(self, items: List[Tuple[str, List[int]]]) -> None:
+    async def prefill_batch(self, items: list[tuple[str, list[int]]]) -> None:
         for sid, prompt in items:
             await self.prefill_single(prompt, sid=sid)
 
-    async def verify_single(self, draft_toks: List[int], draft_rows: Tuple[List[List[int]], List[List[float]]], sid: Optional[str] = None):
+    async def verify_single(self, draft_toks: list[int], draft_rows: tuple[list[list[int]], list[list[float]]], sid: str | None = None):
         """Legacy path wrapper; returns (accepted_len, base_token, hit_eos)."""
         sid = sid or self._default_id
         resp = await self.verify_batch([(sid, draft_toks, draft_rows)])
         item = resp[0]
         return item.accepted_len, item.base_token, item.hit_eos
 
-    async def verify_batch(self, batch: List[Tuple[str, List[int], Tuple[List[List[int]], List[List[float]]]]]) -> List[VerifyResponseItem]:
+    async def verify_batch(self, batch: list[tuple[str, list[int], tuple[list[list[int]], list[list[float]]]]]) -> list[VerifyResponseItem]:
         """
         batch: list of (stream_id, draft_toks, (draft_topk_idx, draft_topk_vals))
         Returns one VerifyResponseItem per input item, same order.
         """
         # Build prompts
-        prompts: List[TokensPrompt] = []
-        Ks: List[int] = []
-        sids: List[str] = []
-        base_topk_candidates: List[int] = []
+        prompts: list[TokensPrompt] = []
+        Ks: list[int] = []
+        sids: list[str] = []
+        base_topk_candidates: list[int] = []
 
         # Collect for a single batched vLLM call
         for sid, draft_toks, (d_idx, _d_vals) in batch:
@@ -168,7 +167,7 @@ class Verifier:
         loop = asyncio.get_running_loop()
         outs = await loop.run_in_executor(None, lambda: self.llm.generate(prompts, sp))
 
-        results: List[VerifyResponseItem] = []
+        results: list[VerifyResponseItem] = []
 
         for (sid, draft_toks, (d_idx_rows, d_val_rows)), out, K in zip(batch, outs, Ks):
             st = self._get_or_create(sid)
@@ -190,7 +189,7 @@ class Verifier:
 
             accepted = 0
             hit_eos = False
-            base_token: Optional[int] = None
+            base_token: int | None = None
 
             for i, tok in enumerate(draft_toks):
                 # Teacher-forced base distribution at this position

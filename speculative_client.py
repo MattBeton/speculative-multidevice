@@ -3,7 +3,6 @@ import argparse
 import asyncio
 import time
 from pathlib import Path
-from typing import Optional, List
 import copy
 
 import numpy as np
@@ -88,7 +87,7 @@ class DraftClient:
             await asyncio.gather(prefill_local, prefill_remote)
 
 
-    async def decode_batch(self, spec_k: int, max_new_tokens: int, timer: TokenTimer) -> List[str]:
+    async def decode_batch(self, spec_k: int, max_new_tokens: int, timer: TokenTimer) -> list[str]:
         """Drive speculative decode for all streams until each finishes or budget hit."""
         initial_lengths = copy.deepcopy(self.model.lengths)
         def _total_committed() -> int:
@@ -109,9 +108,9 @@ class DraftClient:
                 round_count += 1
 
                 # Prepare batch verify request
-                draft_toks_batch: List[List[int]] = [[] for _ in range(self.batch_size)]
-                draft_topk_idx_batch: List[List[List[int]]] = [[] for _ in range(self.batch_size)]
-                draft_topk_vals_batch: List[List[List[float]]] = [[] for _ in range(self.batch_size)]
+                draft_toks_batch: list[list[int]] = [[] for _ in range(self.batch_size)]
+                draft_topk_idx_batch: list[list[list[int]]] = [[] for _ in range(self.batch_size)]
+                draft_topk_vals_batch: list[list[list[float]]] = [[] for _ in range(self.batch_size)]
 
                 # 1) Generate draft tokens for each stream (client work)
                 client_start = time.perf_counter()

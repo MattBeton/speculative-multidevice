@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple, Union
 
 import numpy as np
 
@@ -51,7 +50,7 @@ class HFGenerationModel(GenerationModel):
       per-row rollback use `rollback_tokens(r)`.
     """
 
-    def __init__(self, model_id: Union[str, Path]):
+    def __init__(self, model_id: str | Path):
         self.tok = AutoTokenizer.from_pretrained(str(model_id), use_fast=True, token=HF_TOKEN)
         from_kwargs = {
             "torch_dtype": DTYPE,
@@ -138,7 +137,7 @@ class HFGenerationModel(GenerationModel):
         self.cache = dst
 
     def forward(self, tokens: np.ndarray, only_final: bool = True
-                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if tokens.ndim == 1:
             tokens = tokens[None, :]
         x = torch.as_tensor(tokens, dtype=torch.long, device=DEVICE)
@@ -174,10 +173,10 @@ class HFGenerationModel(GenerationModel):
     def decode(self, generated: list[int]) -> str:
         return self.tok.decode(generated)
 
-    def eos_token_id(self) -> Optional[int]:
+    def eos_token_id(self) -> int | None:
         return getattr(self.tok, "eos_token_id", None)
 
-    def pad_id(self) -> Optional[int]:
+    def pad_id(self) -> int | None:
         pid = getattr(self.tok, "pad_token_id", None)
         if pid is None:
             pid = getattr(self.tok, "eos_token_id", None)

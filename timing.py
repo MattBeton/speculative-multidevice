@@ -1,7 +1,7 @@
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from typing import Callable
 
 
 @dataclass
@@ -20,7 +20,7 @@ class TokenTimer:
     """Utility to keep timing/throughput reporting consistent across scripts."""
 
     def __init__(self) -> None:
-        self._phases: Dict[str, PhaseResult] = {}
+        self._phases: dict[str, PhaseResult] = {}
 
     @contextmanager
     def measure(self, name: str, token_count: Callable[[], int]):
@@ -41,8 +41,8 @@ class TokenTimer:
                 f"[{name:7}] {phase.tokens} toks in {phase.seconds:.3f}s  → {phase.tok_per_sec:.1f} tok/s"
             )
 
-    def get(self, name: str) -> Optional[PhaseResult]:
+    def get(self, name: str) -> PhaseResult | None:
         return self._phases.get(name)
 
-    def phases(self) -> Dict[str, PhaseResult]:
+    def phases(self) -> dict[str, PhaseResult]:
         return dict(self._phases)

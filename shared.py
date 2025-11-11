@@ -5,7 +5,7 @@ import asyncio
 import functools
 import json
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional, Type, Union
+from typing import Type
 
 # Try to use orjson for faster JSON serialization
 try:
@@ -66,13 +66,13 @@ class VerifyResponse(Message):
     hit_eos: list[bool]
 
 
-MessageType = Union[
-    ResetRequest, ResetResponse,
-    PrefillRequest, PrefillResponse,
-    VerifyRequest, VerifyResponse,
-]
+MessageType = (
+    ResetRequest | ResetResponse |
+    PrefillRequest | PrefillResponse |
+    VerifyRequest | VerifyResponse
+)
 
-_TYPE_TO_NAME: Dict[Type[Message], str] = {
+_TYPE_TO_NAME: dict[Type[Message], str] = {
     ResetRequest: "reset",
     ResetResponse: "reset_response",
     PrefillRequest: "prefill",
@@ -80,7 +80,7 @@ _TYPE_TO_NAME: Dict[Type[Message], str] = {
     VerifyRequest: "verify",
     VerifyResponse: "verify_response",
 }
-_NAME_TO_TYPE: Dict[str, Type[Message]] = {v: k for k, v in _TYPE_TO_NAME.items()}
+_NAME_TO_TYPE: dict[str, Type[Message]] = {v: k for k, v in _TYPE_TO_NAME.items()}
 
 class MessageChannel:
     """Line-delimited JSON message transport."""
@@ -93,7 +93,7 @@ class MessageChannel:
             import socket
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    async def recv(self) -> Optional[MessageType]:
+    async def recv(self) -> MessageType | None:
         line = await self._reader.readline()
         if not line:
             return None

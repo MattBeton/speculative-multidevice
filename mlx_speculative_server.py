@@ -1,7 +1,6 @@
 # mlx_speculative_server.py
 import asyncio
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -19,8 +18,8 @@ from shared import (
 
 # ---- Configure the base (verifier) model ----
 BASE_MODEL_PATH = next(Path(
-    # "/Users/frank/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/"
-    "~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/"
+    "~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-3B-Instruct/snapshots/"
+    # "~/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/"
 ).expanduser().glob("*"))
 
 
@@ -85,12 +84,12 @@ class MLXVerifierSession:
         self,
         topk_idx: np.ndarray,                            # (B, K+1, k)
         topk_vals: np.ndarray,                            # (B, K+1, k)
-        draft_toks: List[List[int]],
-        draft_idx: List[List[List[int]]],           # (B, K, k) as lists
-        draft_val: List[List[List[float]]],                  # (B, K, k) as lists
+        draft_toks: list[list[int]],
+        draft_idx: list[list[list[int]]],           # (B, K, k) as lists
+        draft_val: list[list[list[float]]],                  # (B, K, k) as lists
         sample_mode: str = "argmax",                     # "argmax" (fast) or "topk"
         sample_topk: int = 20,                            # used only if sample_mode == "topk"
-    ) -> Tuple[List[int], List[int], List[bool]]:
+    ) -> tuple[list[int], list[int], list[bool]]:
         K = len(draft_idx[0])
 
         import random

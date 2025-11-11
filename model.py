@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 import numpy as np
 
-from typing import Optional, Tuple
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import load_tokenizer

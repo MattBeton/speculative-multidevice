@@ -1,4 +1,3 @@
-from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 import torch.nn as nn
@@ -41,7 +40,7 @@ def make_leftpad_causal_4d_mask(lengths: list[int]):
             mask[b, 0, p, p] = 0.0
     return mask
 
-def print_cache(cache: DynamicCache, idx: int, layer: Optional[int]=0):
+def print_cache(cache: DynamicCache, idx: int, layer: int | None=0):
     print(cache.layers[layer].keys[idx, 0, :, 0])
 
 def load_model(model_id: str):
