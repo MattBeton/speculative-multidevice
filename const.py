@@ -18,6 +18,8 @@ PORT = int(os.environ.get("HF_SPEC_PORT", "7070"))
 # Random seed
 SEED = 90
 
+# print(f'{torch.mps.is_available()}')
+
 # Device and dtype configuration
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -26,6 +28,9 @@ if torch.cuda.is_available():
     else:
         DTYPE = torch.float16
     torch.backends.cuda.matmul.allow_tf32 = True
+elif torch.mps.is_available():
+    DEVICE = torch.device("mps")
+    DTYPE = torch.bfloat16
 else:
     DEVICE = torch.device("cpu")
     DTYPE = torch.float32
