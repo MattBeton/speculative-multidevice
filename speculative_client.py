@@ -128,19 +128,9 @@ class DraftClient:
 
                     current = tok[:, 0].tolist()
 
-                # Commit the last drafted token (t_{K-1}) so all K drafts are present locally.
-                # This avoids the m==K corner case without any base-token forwards.
+                # TODO: This shouldn't be necessary! I'm not sure how this is fixing my issue...
                 y_last = np.array([current], dtype=np.int32).reshape(-1, 1)
                 await run_mlx(self.model.forward, y_last, only_final=False)
-
-                # ### TMP
-                # for b in range(3):
-                #     print(self.model.decode(self.model.tokens[b, :]))
-                # raise Exception('stop')
-                
-                # print(np.array(draft_toks_batch).shape)
-                # print(np.array(draft_topk_idx_batch).shape)
-                # print(np.array(draft_topk_vals_batch).shape)
 
                 # Pause client timing before server wait
                 client_time_before_server = time.perf_counter() - client_start
@@ -165,7 +155,9 @@ class DraftClient:
                 client_start = time.perf_counter()
 
                 # Roll back the unaccepted drafted tokens (base is still deferred).
-                await run_mlx(self.model.rollback_tokens, [spec_k - r for r in resp.accepted_len])
+                rollback_values = [spec_k - r for r in resp.accepted_len]
+                # print(rollback_values)
+                await run_mlx(self.model.rollback_tokens, rollback_values)
 
                 # Seed next round; never propagate -1 (EOS sentinel).
                 self.last = [
@@ -235,6 +227,7 @@ async def main(host: str = 'localhost') -> None:
             print(f"--- [Stream {i}] ---")
             print(txt)
             print()
+            break
     finally:
         await channel.close()
 
