@@ -77,24 +77,30 @@ class HFGenerationModel(GenerationModel):
         except TypeError:
             self.cache = DynamicCache(config=self.model.config)
 
-    def trim_cache(self, n: int) -> None:
-        if n <= 0:
-            return
-        if self.cache is None or len(self.cache) == 0:
-            return
+    def forward(self, tokens: np.ndarray, only_final: bool = True
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if tokens.ndim == 1:
+            tokens = tokens[None, :]
+        x = torch.as_tensor(tokens, dtype=torch.long, device=DEVICE)
 
-        # Uniform trim across rows: slice off the tail S-n
-        dst = DynamicCache()
-        for layer in range(len(self.cache)):
-            K = self.cache.layers[layer].keys
-            V = self.cache.layers[layer].values
-            assert K is not None and V is not None
-            S = K.shape[2]
-            keep = max(S - n, 0)
-            K_new = K[:, :, :keep, :].contiguous()
-            V_new = V[:, :, :keep, :].contiguous()
-            dst.update(K_new, V_new, layer)
-        self.cache = dst
+        with torch.inference_mode():
+            out = self.model(input_ids=x, past_key_values=self.cache, use_cache=True)
+
+        logits = out.logits  # (B,T,V)
+        if only_final:
+            logits = logits[:, -1, :]  # (B,V)
+
+        # torch top-k → NumPy
+        sampled, topk_idx, topk_vals = _topk_sample_torch(logits, TOP_K)
+
+        # Optional: sync CUDA to make timings comparable to MLX measurements
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        return sampled, topk_idx, topk_vals
+
+    def prefill(self, tokens: list[list[int]]) -> None:
+        ...
 
     def rollback_tokens(self, r: list[int]) -> None:
         """
@@ -136,27 +142,24 @@ class HFGenerationModel(GenerationModel):
 
         self.cache = dst
 
-    def forward(self, tokens: np.ndarray, only_final: bool = True
-                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if tokens.ndim == 1:
-            tokens = tokens[None, :]
-        x = torch.as_tensor(tokens, dtype=torch.long, device=DEVICE)
+    def trim_cache(self, n: int) -> None:
+        if n <= 0:
+            return
+        if self.cache is None or len(self.cache) == 0:
+            return
 
-        with torch.inference_mode():
-            out = self.model(input_ids=x, past_key_values=self.cache, use_cache=True)
-
-        logits = out.logits  # (B,T,V)
-        if only_final:
-            logits = logits[:, -1, :]  # (B,V)
-
-        # torch top-k → NumPy
-        sampled, topk_idx, topk_vals = _topk_sample_torch(logits, TOP_K)
-
-        # Optional: sync CUDA to make timings comparable to MLX measurements
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        return sampled, topk_idx, topk_vals
+        # Uniform trim across rows: slice off the tail S-n
+        dst = DynamicCache()
+        for layer in range(len(self.cache)):
+            K = self.cache.layers[layer].keys
+            V = self.cache.layers[layer].values
+            assert K is not None and V is not None
+            S = K.shape[2]
+            keep = max(S - n, 0)
+            K_new = K[:, :, :keep, :].contiguous()
+            V_new = V[:, :, :keep, :].contiguous()
+            dst.update(K_new, V_new, layer)
+        self.cache = dst
 
     def tokenize(self, prompt: str) -> np.ndarray:
         # Prefer chat template for chat-tuned models; fall back to plain encode
@@ -181,4 +184,3 @@ class HFGenerationModel(GenerationModel):
         if pid is None:
             pid = getattr(self.tok, "eos_token_id", None)
         return pid
-
