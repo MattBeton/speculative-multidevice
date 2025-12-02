@@ -24,7 +24,7 @@ def _pure_single_run(model: MLXGenerationModel):
 
     # First generated token comes from the last prefill logits (no extra model call)
     generated = [int(toks[-1])]
-    eos = model.eos_token_id()
+    eos = model.eos_token_id
 
     # --- DECODE one token at a time with KV cache (only pass the LAST token) ---
     last = generated[-1]

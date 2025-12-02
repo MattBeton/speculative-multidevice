@@ -35,6 +35,13 @@ async def run_mlx(func, *args, **kwargs):
     bound = functools.partial(func, *args, **kwargs)
     return await loop.run_in_executor(_MLX_EXEC, bound)
 
+def mlxify(func):
+    """Turn a sync function into an async one that runs via run_mlx."""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        return await run_mlx(func, *args, **kwargs)
+    return wrapper
+
 
 # ---------- Wire messages ----------
 class Message(BaseModel):

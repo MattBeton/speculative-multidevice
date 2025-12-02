@@ -17,7 +17,6 @@ from shared import (
     ResetResponse,
     VerifyRequest,
     VerifyResponse,
-    run_mlx,
 )
 
 from const import SPEC_K, MAX_NEW_TOKENS
@@ -66,7 +65,7 @@ class DraftClient:
     async def prefill_both(self, timer: TokenTimer) -> None:
         """Tokenize + prefill locally; send prefill request remotely."""
         prompts: list[list[int]] = [
-            await run_mlx(self.model.tokenize, prompt)
+            await self.model.tokenize(prompt)
             for prompt in self._prompts
         ]
 
@@ -75,7 +74,7 @@ class DraftClient:
 
         with timer.measure("prefill", lambda: sum(len(prompt) - 1 for prompt in prompts)):
             prefill_local = asyncio.create_task(
-                run_mlx(self.model.prefill, tokens)
+                self.model.prefill(tokens)
             )
 
             async def send_and_recv():
@@ -119,7 +118,7 @@ class DraftClient:
                 for _ in range(spec_k):
                     y = np.array([current], dtype=np.int32).reshape(-1, 1)
                     # print(y.shape)
-                    tok, s_topk_idx, s_topk_vals = await run_mlx(self.model.forward, y, only_final=False)  # tok: (B, 1), topk: (B, 1, K)
+                    tok, s_topk_idx, s_topk_vals = await self.model.forward(y, only_final=False)  # tok: (B, 1), topk: (B, 1, K)
 
                     for b in range(self.batch_size):  # Append per-batch-item to maintain (B, S, K) structure
                         draft_toks_batch[b].append(int(tok[b, 0]))
@@ -130,7 +129,7 @@ class DraftClient:
 
                 # TODO: This shouldn't be necessary! I'm not sure how this is fixing my issue...
                 y_last = np.array([current], dtype=np.int32).reshape(-1, 1)
-                await run_mlx(self.model.forward, y_last, only_final=False)
+                await self.model.forward(y_last, only_final=False)
 
                 # Pause client timing before server wait
                 client_time_before_server = time.perf_counter() - client_start
@@ -157,7 +156,7 @@ class DraftClient:
                 # Roll back the unaccepted drafted tokens (base is still deferred).
                 rollback_values = [spec_k - r for r in resp.accepted_len]
                 # print(rollback_values)
-                await run_mlx(self.model.rollback_tokens, rollback_values)
+                await self.model.rollback_tokens(rollback_values)
 
                 # Seed next round; never propagate -1 (EOS sentinel).
                 self.last = [
@@ -177,7 +176,7 @@ class DraftClient:
         #     print(self.model.decode(self.model.tokens[b, :]))
 
         # Decode final texts
-        return [self.model.decode(self.model.tokens[i, :]) for i in range(self.batch_size)]
+        return [await self.model.decode(self.model.tokens[i, :]) for i in range(self.batch_size)]
 
 
 async def main(host: str = 'localhost') -> None:

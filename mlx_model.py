@@ -8,6 +8,7 @@ from mlx_lm.tokenizer_utils import load_tokenizer
 from mlx_lm.utils import load_model
 from mlx_lm.models.cache import BatchKVCache
 
+from shared import mlxify
 from const import SEED, TOP_K
 from model import GenerationModel
 
@@ -82,12 +83,18 @@ class MLXGenerationModel(GenerationModel):
         self.lengths = [L + t.shape[1] for L in self.lengths]
 
     @override
+    @mlxify
+    # TODO: Make consistent of whether we're using numpy or lists?
     def forward(
             self, 
             tokens: np.ndarray[Any, np.dtype[np.int32]], 
             add_tokens=True, 
             only_final=True
-    ) -> tuple[np.ndarray[Any, np.dtype[np.int32]], np.ndarray[Any, np.dtype[np.int32]], np.ndarray[Any, np.dtype[np.float32]]]:
+    ) -> tuple[
+        np.ndarray[Any, np.dtype[np.int32]], 
+        np.ndarray[Any, np.dtype[np.int32]], 
+        np.ndarray[Any, np.dtype[np.float32]
+    ]]:
         if add_tokens:
             self._add_tokens(tokens)
 
@@ -108,7 +115,9 @@ class MLXGenerationModel(GenerationModel):
         )
 
     @override
+    @mlxify
     def prefill(self, tokens: list[list[int]]) -> None:
+        # TODO: remove the self.forward() and replace with a self.model() call.
         self.lengths = [len(prompt) for prompt in tokens]
 
         n_layers = len(self.model.layers)
@@ -119,12 +128,18 @@ class MLXGenerationModel(GenerationModel):
         # Pad before prefill
         S = max(self.lengths)
         self.tokens = np.full((len(tokens), S), self.pad_id, dtype=np.int32)
+
         for i, prompt in enumerate(tokens):
             self.tokens[i, S - len(prompt):] = np.asarray(prompt, dtype=np.int32)
 
-        self.forward(self.tokens, add_tokens=False)
+        tokens_mlx = mx.array(self.tokens, dtype=mx.int32)
+
+        logits = self.model(tokens_mlx, cache=self.cache)  # (B, T, V)
+
+        mx.eval(logits) # perf optimization could be to only eval the kv cache
 
     @override
+    @mlxify
     def rollback_tokens(self, r: list[int]) -> None:
         """
         Per-row rollback for MLX caches that pre-allocate capacity.
@@ -197,12 +212,14 @@ class MLXGenerationModel(GenerationModel):
         self.tokens = toks_new
 
     @override
+    @mlxify
     def tokenize(self, prompt: str) -> np.ndarray[Any, np.dtype[np.int32]]:
         return np.asarray(self.tok.apply_chat_template(
             [{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=True
         ))
 
     @override
+    @mlxify
     def decode(self, generated: list[int]) -> str:
         return self.tok.decode(generated)
 
