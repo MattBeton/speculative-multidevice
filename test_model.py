@@ -26,21 +26,20 @@ def model() -> GenerationModel:
 
     return MLXGenerationModel(DRAFT_MODEL_PATH)
 
-@pytest.mark.asyncio
-async def test_model_generation(model: GenerationModel):
+def test_model_generation(model: GenerationModel):
     model.reset()
     eos = model.eos_token_id
 
-    ids = await model.tokenize(PROMPTS[0])
+    ids = model.tokenize(PROMPTS[0])
 
-    await model.prefill([ids[:-1]])
+    model.prefill([ids[:-1]])
 
     generated = []
     last = ids[-1]
     for _ in range(20):
         y = np.array([[last]], dtype=np.int32)
 
-        toks, _, _ = await model.forward(y)
+        toks, _, _ = model.forward(y)
 
         last = int(toks[-1])
         generated.append(last)
@@ -48,5 +47,4 @@ async def test_model_generation(model: GenerationModel):
         if last == eos:
             break
 
-    print(await model.decode(model.tokens.reshape(-1).tolist()))
-    # print(await model.decode(generated))
+    print(model.decode(model.tokens.reshape(-1).tolist()))

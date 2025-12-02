@@ -29,17 +29,17 @@ from pydantic import BaseModel, ConfigDict
 # All MLX work runs on this single thread to avoid thread-safety gotchas.
 _MLX_EXEC = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx")
 
-async def run_mlx(func, *args, **kwargs):
-    """Run blocking MLX code on the dedicated single-thread executor."""
-    loop = asyncio.get_running_loop()
+def run_mlx_sync(func, *args, **kwargs):
+    """Run blocking MLX code on the dedicated single-thread executor, synchronously."""
     bound = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(_MLX_EXEC, bound)
+    fut = _MLX_EXEC.submit(bound)
+    return fut.result()  # blocks until done
 
 def mlxify(func):
-    """Turn a sync function into an async one that runs via run_mlx."""
+    """Turn a sync function into a sync one that runs via the MLX executor."""
     @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        return await run_mlx(func, *args, **kwargs)
+    def wrapper(*args, **kwargs):
+        return run_mlx_sync(func, *args, **kwargs)
     return wrapper
 
 

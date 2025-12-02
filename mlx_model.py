@@ -117,7 +117,6 @@ class MLXGenerationModel(GenerationModel):
     @override
     @mlxify
     def prefill(self, tokens: list[list[int]]) -> None:
-        # TODO: remove the self.forward() and replace with a self.model() call.
         self.lengths = [len(prompt) for prompt in tokens]
 
         n_layers = len(self.model.layers)
